@@ -9,6 +9,11 @@ import { constants } from 'node:fs';
 import { access, cp, mkdir, open, readdir, rename, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 
+/**
+ * Whether a file or directory exists at a path. Every error answers false,
+ * not only ENOENT; the journal and rollback code use it to skip steps that
+ * never happened.
+ */
 export async function pathExists(target: string): Promise<boolean> {
   try {
     await access(target, constants.F_OK);
@@ -18,6 +23,7 @@ export async function pathExists(target: string): Promise<boolean> {
   }
 }
 
+/** Whether a path is a directory (links followed); false when it is missing or cannot be read. */
 export async function isDirectory(target: string): Promise<boolean> {
   try {
     return (await stat(target)).isDirectory();
@@ -52,6 +58,11 @@ export async function tempSiblings(target: string): Promise<string[]> {
     .map((name) => path.join(dir, name));
 }
 
+/**
+ * Options of writeFileAtomic: the permission bits of the new file, and
+ * whether it is flushed to the disk before the rename (the journal and the
+ * lineage file are).
+ */
 export interface WriteOptions {
   /** Permission bits of the new file (the process umask still applies). */
   mode?: number | undefined;

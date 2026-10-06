@@ -27,6 +27,12 @@ import type { HostTarget } from './ssh-host.ts';
  */
 export type JournalStatus = 'running' | 'done' | 'failed' | 'restored' | 'resolved';
 
+/**
+ * One end of a journaled operation, as far as it is known: account,
+ * organization, record id and CLI session id (a transcript without a record
+ * has only the last). It tells a person reading the journal, or the output
+ * of `ccas journal --json`, what the operation worked on.
+ */
 export interface JournalEndpoint {
   accountId?: string | undefined;
   orgId?: string | undefined;
@@ -52,6 +58,12 @@ export interface RemoteSteps {
   tombstoned: string[];
 }
 
+/**
+ * One operation in journal.jsonl: what it was, how it ended, and every path
+ * it created, moved or backed up, here and on the SSH host. OperationLog
+ * writes it step by step, restore undoes it from these lists, and
+ * `ccas journal` and the TUI list it.
+ */
 export interface JournalEntry {
   id: string;
   /** ISO time the operation started. */
@@ -87,8 +99,15 @@ export interface JournalEntry {
   resolvedAt?: string | undefined;
 }
 
+/** File name of the journal in the tool's data directory (<dataDir>/journal.jsonl). */
 export const JOURNAL_FILE_NAME = 'journal.jsonl';
 
+/**
+ * A new journal id: the UTC start time to the second and six random hex
+ * digits ("20261006T101500Z-a1b2c3"), so ids sort by time and two
+ * operations in one second still differ. The id also names the operation's
+ * backup directory and tags the files it sets aside on an SSH host.
+ */
 export function newJournalId(): string {
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
   return `${stamp}-${randomBytes(3).toString('hex')}`;
@@ -99,6 +118,11 @@ export function displayStatus(entry: JournalEntry): string {
   return entry.status === 'running' ? 'interrupted' : entry.status;
 }
 
+/**
+ * The journal file of one data directory. An entry is appended when its
+ * operation starts and rewritten in place at every step, and both writes
+ * reach the disk before they return. Reading skips a torn last line.
+ */
 export class Journal {
   private readonly file: string;
 

@@ -51,10 +51,26 @@ import {
 import { packageRoot, resolvePaths, type Paths } from './paths.ts';
 import { SummaryCache } from './summary-cache.ts';
 
+/** Exit code 0: the command did what was asked. */
 export const EXIT_OK = 0;
+/**
+ * Exit code 1: a usage error or another error, also a conversation selector
+ * that does not match exactly one conversation.
+ */
 export const EXIT_USAGE = 1;
+/**
+ * Exit code 2: writing refused, because the app or a claude process runs
+ * (also one that appeared during the operation, which was then rolled
+ * back) or because that could not be checked.
+ */
 export const EXIT_REFUSED = 2;
+/** Exit code 3: part of a transfer failed; the result lines name the conversations. */
 export const EXIT_PARTIAL = 3;
+/**
+ * Exit code 4: an interrupted operation needs `ccas restore <id>` or
+ * `ccas resolve <id>` first (see interrupted.ts). The TUI ends with it too
+ * when the person chooses to exit at that question.
+ */
 export const EXIT_INTERRUPTED = 4;
 
 const USAGE = `ccas - move or copy Claude Code Desktop conversations between accounts
@@ -85,6 +101,11 @@ Exit codes: 0 ok, 1 usage or other error, 2 writes refused (Claude Code running)
 3 part of a transfer failed, 4 an interrupted operation needs restore or resolve.
 `;
 
+/**
+ * Where the commands of main write their output. The entry point at the end
+ * of this file binds it to standard output and standard error. The TUI,
+ * started when no command is given, writes to the terminal itself.
+ */
 export interface Io {
   out: (text: string) => void;
   err: (text: string) => void;
@@ -197,6 +218,12 @@ function conversationRow(conversation: Conversation, accounts: readonly AccountI
   return row;
 }
 
+/**
+ * One result line of a transfer, as `ccas transfer` prints it and the TUI
+ * shows it: what happened to the conversation and on which account, with
+ * the new record id, the SSH host step and the journal id where there are
+ * any. A dry run gets a "[dry-run] " prefix.
+ */
 export function describeOutcome(outcome: TransferOutcome): string {
   const target = accountLabel(outcome.item.target);
   const prefix = outcome.dryRun ? '[dry-run] ' : '';
@@ -489,6 +516,12 @@ function parse(argv: string[]): ReturnType<typeof parseArgs<{ options: typeof OP
   return parseArgs({ args: argv, options: OPTION_SPEC, allowPositionals: true, strict: true });
 }
 
+/**
+ * Runs one command line (the arguments after the script path) and resolves
+ * to the exit code. Usage and operation errors are reported through `io`
+ * and end with EXIT_USAGE instead of a rejection. Without a command it
+ * starts the TUI.
+ */
 export async function main(argv: string[], io: Io): Promise<number> {
   let parsed: ReturnType<typeof parse>;
   try {

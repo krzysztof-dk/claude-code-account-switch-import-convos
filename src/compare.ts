@@ -14,8 +14,18 @@
 import type { SessionRecord } from './records.ts';
 import type { TranscriptSummary } from './transcripts.ts';
 
+/**
+ * How a target transcript relates to its source by their uuid lists (the
+ * cases are listed at the top of this file). assessSync in inventory.ts
+ * maps it to a SyncState.
+ */
 export type Relation = 'identical' | 'target-behind' | 'target-ahead' | 'diverged' | 'unrelated';
 
+/**
+ * The result of compareChains: the relation and the counts behind it, which
+ * describeComparison in format.ts turns into text such as "target lacks 12
+ * lines".
+ */
 export interface ChainComparison {
   relation: Relation;
   /** Number of leading uuids both chains share. */
@@ -26,6 +36,12 @@ export interface ChainComparison {
   targetExtra: number;
 }
 
+/**
+ * Compares the uuid list of a source transcript with the one of its linked
+ * copy on the target by their longest common prefix. It is only asked about
+ * a pair already known to be linked: content alone never makes two
+ * conversations a pair.
+ */
 export function compareChains(source: readonly string[], target: readonly string[]): ChainComparison {
   let commonPrefix = 0;
   const limit = Math.min(source.length, target.length);
@@ -45,6 +61,12 @@ export function compareChains(source: readonly string[], target: readonly string
   return { relation, commonPrefix, sourceExtra, targetExtra };
 }
 
+/**
+ * What consistencyWarnings compares for one side of a linked pair: the
+ * record's directory and creation time, and the transcript's directory,
+ * first timestamp and first uuid. Either part may be missing (a transcript
+ * without a record, a record without a transcript).
+ */
 export interface ConsistencyFacts {
   record?: Pick<SessionRecord, 'cwd' | 'originCwd' | 'createdAt'> | undefined;
   summary?: Pick<TranscriptSummary, 'cwd' | 'firstTimestamp' | 'rootUuid'> | null | undefined;

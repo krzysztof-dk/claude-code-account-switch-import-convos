@@ -51,8 +51,20 @@ import { listTranscripts, summarizeTranscript, type TranscriptLocation, type Tra
  */
 export type Origin = 'desktop' | 'remote-control' | 'claude.ai' | 'desktop-unlisted' | 'terminal' | 'unknown';
 
+/**
+ * Marks shown next to a conversation: archived (isArchived in its record),
+ * no-transcript (a record whose transcript is missing), adopted (the app
+ * adopted it from another surface, or its claude.ai owner is another
+ * account than the one whose directory holds the record).
+ */
 export type ConversationFlag = 'archived' | 'no-transcript' | 'adopted';
 
+/**
+ * One entry the tool can transfer: a record of some account with its
+ * transcript, a record alone, or a transcript that no record points at
+ * (unlisted). buildInventory builds them; assessSync, the operations, the
+ * lists and the TUI read them.
+ */
 export interface Conversation {
   /**
    * First transcript uuid, or the CLI session id when there is none: shown in
@@ -90,6 +102,12 @@ export interface Conversation {
   links: LineageEndpoint[];
 }
 
+/**
+ * Everything one look at the disk found, built by buildInventory: the
+ * accounts with their resolved e-mails, the listed conversations per
+ * account, the unlisted transcripts, problems met while reading records,
+ * and the CLI and desktop logins.
+ */
 export interface Inventory {
   accounts: AccountInfo[];
   /** Listed conversations per account key (accountId/orgId). */
@@ -100,6 +118,11 @@ export interface Inventory {
   loggedInAccountId: string | null;
 }
 
+/**
+ * What buildInventory needs besides the paths: the account memory, which it
+ * updates and saves, and optionally the summary cache, the lineage links
+ * and a progress callback (the TUI shows it in its spinner).
+ */
 export interface BuildOptions {
   store: AccountStore;
   cache?: SummaryCache | undefined;
@@ -373,6 +396,12 @@ export type SyncState =
   | 'ambiguous'
   | 'no-transcript';
 
+/**
+ * How one source conversation stands against the target account, as
+ * assessSync finds it: the state, the linked copy when there is exactly
+ * one, the uuid comparison of the pair, and warnings about mismatches.
+ * executeTransfer decides from it what to do, and the lists show it.
+ */
 export interface SyncAssessment {
   state: SyncState;
   /** The copy already on the target account, when there is exactly one. */

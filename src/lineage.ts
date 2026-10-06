@@ -17,6 +17,11 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { writeFileAtomic } from './fsx.ts';
 
+/**
+ * One end of a lineage link, named the way refersTo in inventory.ts matches
+ * conversations: account, organization and record id for a conversation
+ * with a record, the CLI session id alone for a transcript without one.
+ */
 export interface LineageEndpoint {
   /** Undefined for transcripts that have no record on any account. */
   accountId?: string | undefined;
@@ -25,6 +30,13 @@ export interface LineageEndpoint {
   cliSessionId: string;
 }
 
+/**
+ * One copy, update or import: from which conversation to which, by which
+ * journal entry, and how long the source transcript was at that moment,
+ * which marks where the inherited session_context lines end. operations.ts
+ * adds it once the copy's files are in place and before its record is
+ * written.
+ */
 export interface LineageLink {
   rootUuid: string;
   /** Epoch milliseconds. */
@@ -39,8 +51,14 @@ export interface LineageLink {
   target: LineageEndpoint;
 }
 
+/** File name of the lineage links in the tool's data directory (<dataDir>/lineage.json). */
 export const LINEAGE_FILE_NAME = 'lineage.json';
 
+/**
+ * The lineage links of one data directory, held in memory after load and
+ * written whole on every add. buildInventory reads them to pair copies with
+ * their originals and to keep inherited e-mails from voting.
+ */
 export class LineageStore {
   private readonly file: string;
   private readonly links: LineageLink[];

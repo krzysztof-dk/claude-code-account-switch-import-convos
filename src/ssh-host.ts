@@ -77,6 +77,11 @@ export function describeHost(target: HostTarget): string {
   return target.port === undefined ? target.host : `${target.host}:${target.port}`;
 }
 
+/**
+ * How a script run on the host ended, as a HostRunner reports it. The
+ * callers read the CCAS_* marker lines from stdout and take the reason of a
+ * failure from them, else from stderr.
+ */
 export interface HostRunResult {
   /** Exit code of the remote script, 255 when ssh could not connect, null when killed by a signal. */
   code: number | null;
@@ -281,6 +286,10 @@ export interface HostProbe {
   targetLive: string[];
 }
 
+/**
+ * What probeScript looks for on the host: the original's transcript, the
+ * copy's, and the path the original's record gives as a hint.
+ */
 export interface ProbeRequest {
   /** CLI session id of the original, whose transcript is copied. */
   sourceCliSessionId: string;
@@ -371,6 +380,11 @@ export async function probeHost(runner: HostRunner, target: HostTarget, request:
   };
 }
 
+/**
+ * What copyScript makes on the host: a copy of the original's transcript
+ * and side folder under the copy's CLI session id, in the original's folder
+ * (found by probeHost).
+ */
 export interface HostCopyRequest {
   /** Folder of the original on the host (HostProbe.dir); the copy goes next to it. */
   dir: string;
@@ -443,6 +457,11 @@ export function copyScript(request: HostCopyRequest): string {
   ].join('\n');
 }
 
+/**
+ * What copyOnHost did, from the marker lines the script printed: the paths
+ * it created, the ones it kept aside, and the session ids whose Remote
+ * Control link it ended.
+ */
 export interface HostCopyResult {
   created: string[];
   /** Paths replaced ones were moved from (each now at path + backup suffix). */
@@ -486,6 +505,10 @@ export async function tombstoneOnHost(runner: HostRunner, target: HostTarget, tr
   return markerValues(result.stdout, 'CCAS_TOMBSTONE');
 }
 
+/**
+ * What undoScript undoes on the host: the created and moved paths of a
+ * journal entry (JournalEntry.remote) and the tag of the set-aside names.
+ */
 export interface HostUndoRequest {
   /** Paths the operation created, in the order it announced them. */
   created: readonly string[];
@@ -524,6 +547,10 @@ export function undoScript(request: HostUndoRequest): string {
   return lines.join('\n');
 }
 
+/**
+ * What undoOnHost did, as lines for the restore output: the steps taken and
+ * the warnings, each naming the host.
+ */
 export interface HostUndoResult {
   steps: string[];
   warnings: string[];

@@ -23,6 +23,12 @@ import { writeFileAtomic } from './fsx.ts';
 import { isUuid } from './records.ts';
 import { listSubdirectories } from './fsx.ts';
 
+/**
+ * One account directory of the desktop app: the account and organization
+ * uuids that name it and its path. discoverAccountDirs finds them under
+ * claude-code-sessions, the records of the account live directly in `dir`,
+ * and AccountInfo adds what the tool resolved about the account.
+ */
 export interface AccountDir {
   accountId: string;
   orgId: string;
@@ -30,6 +36,11 @@ export interface AccountDir {
   dir: string;
 }
 
+/**
+ * The key an account directory is filed under ("accountId/orgId"): the
+ * inventory's byAccount map uses it, and a person may type it on the
+ * command line to name an account.
+ */
 export function accountKey(accountId: string, orgId: string): string {
   return `${accountId}/${orgId}`;
 }
@@ -71,6 +82,12 @@ export async function readLastKnownAccountUuid(desktopConfigFile: string): Promi
   return isUuid(value) ? value : null;
 }
 
+/**
+ * The CLI's login from the oauthAccount block of ~/.claude.json, reduced to
+ * the four fields the tool uses (readCliOauthAccount). resolveEmail trusts
+ * its e-mail for the account it names, and the inventory remembers its
+ * organization name for that account.
+ */
 export interface CliOauthAccount {
   accountUuid: string;
   organizationUuid: string | null;
@@ -101,8 +118,21 @@ export async function readCliOauthAccount(cliConfigFile: string): Promise<CliOau
   };
 }
 
+/**
+ * Where an account's e-mail came from: cli-config is the CLI login,
+ * transcripts the session_context lines of the account's own sessions,
+ * manual what the person typed in the TUI. Kept in accounts.json next to
+ * the address, so a later run knows how much to trust it (see
+ * AccountStore.setEmail).
+ */
 export type EmailSource = 'cli-config' | 'transcripts' | 'manual';
 
+/**
+ * One account as remembered in accounts.json between runs: the e-mail found
+ * earlier and where it came from, the person's own name for the account,
+ * the organization name, and when the tool first and last saw the
+ * directory. AccountStore loads, changes and saves these.
+ */
 export interface StoredAccount {
   accountId: string;
   orgId: string;
@@ -121,6 +151,7 @@ interface AccountsFile {
   accounts: StoredAccount[];
 }
 
+/** File name of the account memory in the tool's data directory (<dataDir>/accounts.json). */
 export const ACCOUNTS_FILE_NAME = 'accounts.json';
 
 /** Persistent memory of accounts: e-mails found earlier and names given by the person. */
@@ -214,11 +245,22 @@ export class AccountStore {
   }
 }
 
+/**
+ * How many sessions of one account directory name an e-mail in their
+ * session_context lines. The inventory counts them (for a copy, only lines
+ * past the copy point) and resolveEmail takes the majority.
+ */
 export interface EmailVote {
   email: string;
   count: number;
 }
 
+/**
+ * The e-mail chosen for an account directory, where it came from ("stored"
+ * means remembered in accounts.json rather than found in this run), and a
+ * short justification the account table shows next to it. All three are
+ * null when no source knows the address.
+ */
 export interface EmailResolution {
   email: string | null;
   source: EmailSource | 'stored' | null;
@@ -261,6 +303,13 @@ export function resolveEmail(
   return { email: null, source: null, evidence: null };
 }
 
+/**
+ * An account directory with everything the tool resolved about it, as
+ * buildInventory assembles it: the e-mail and its evidence, the person's
+ * name for it, the organization name, whether the app is signed in with it,
+ * and how many records it holds. The CLI, the TUI and format.ts show
+ * accounts from this.
+ */
 export interface AccountInfo extends AccountDir {
   email: string | null;
   emailSource: EmailSource | 'stored' | null;

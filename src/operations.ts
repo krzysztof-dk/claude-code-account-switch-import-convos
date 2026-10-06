@@ -102,9 +102,25 @@ import {
 } from './ssh-host.ts';
 import { appendBridgeTombstones, copyRewritingSessionId, copySidecar, isSshMirror, liveBridges, sshMirrorDir } from './transcripts.ts';
 
+/**
+ * copy: the target gets a copy and the source stays as it is (an import
+ * from "No account" is a copy of a transcript without a record). move: the
+ * conversation ends up on the target account, and what the source held
+ * goes into the backup.
+ */
 export type TransferMode = 'copy' | 'move';
+/**
+ * What to do when the linked copy on the target is newer than the source or
+ * diverged from it: skip leaves it, overwrite replaces it with the source.
+ * A copy that holds another conversation is never overwritten.
+ */
 export type ConflictPolicy = 'skip' | 'overwrite';
 
+/**
+ * One conversation to transfer, as the CLI and the TUI hand it to
+ * executeTransfer: the source, the target account, the mode, the
+ * assessment of the source against the target and the conflict policy.
+ */
 export interface TransferItem {
   source: Conversation;
   target: AccountInfo;
@@ -120,6 +136,12 @@ export interface TransferItem {
  */
 export type OutcomeAction = 'created' | 'updated' | 'moved' | 'repaired' | 'up-to-date' | 'skipped' | 'refused' | 'failed';
 
+/**
+ * What executeTransfer did with one item, or would do in a dry run: the
+ * action and its reason, the journal entry, the new ids of a fresh copy,
+ * the host step and warnings. describeOutcome in cli.ts makes the result
+ * line from it, and summaryLine counts the actions.
+ */
 export interface TransferOutcome {
   item: TransferItem;
   action: OutcomeAction;
@@ -134,6 +156,11 @@ export interface TransferOutcome {
   dryRun: boolean;
 }
 
+/**
+ * What an operation needs from the run around it: the paths, the journal
+ * and the lineage store, whether it is a dry run, and the parts tests
+ * replace (the write guard, the clock and the host runner).
+ */
 export interface OperationContext {
   paths: Paths;
   journal: Journal;
@@ -951,6 +978,11 @@ export async function executeTransfer(context: OperationContext, item: TransferI
   }
 }
 
+/**
+ * What restoreEntry did with a journal entry, or would do in a dry run: the
+ * entry, the id of the journal entry of the restore itself (null in a dry
+ * run), the steps and the warnings. The CLI and the TUI print them.
+ */
 export interface RestoreResult {
   entry: JournalEntry;
   restoreJournalId: string | null;

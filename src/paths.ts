@@ -12,6 +12,11 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+/**
+ * Overrides for resolvePaths: the command-line options --user-data,
+ * --claude-dir and --data, and for tests the home directory and the
+ * environment.
+ */
 export interface PathOverrides {
   /** Electron userData directory of the desktop app. */
   userData?: string | undefined;
@@ -25,6 +30,10 @@ export interface PathOverrides {
   env?: NodeJS.ProcessEnv | undefined;
 }
 
+/**
+ * Every location the tool reads or writes, resolved once per run by
+ * resolvePaths and passed to the modules that need them.
+ */
 export interface Paths {
   home: string;
   userData: string;
@@ -52,10 +61,19 @@ export function packageRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 }
 
+/**
+ * Where the desktop app keeps its data on macOS, under the given home. The
+ * live-directory check compares the resolved userData with this path.
+ */
 export function defaultUserData(home: string): string {
   return path.join(home, 'Library', 'Application Support', 'Claude');
 }
 
+/**
+ * Resolves every location from the overrides, CLAUDE_CONFIG_DIR and the
+ * defaults. liveUserData is true whenever userData resolves to the app's
+ * own directory, also when --user-data names it explicitly.
+ */
 export function resolvePaths(overrides: PathOverrides = {}): Paths {
   const home = overrides.home ?? homedir();
   const env = overrides.env ?? process.env;

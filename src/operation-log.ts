@@ -19,10 +19,21 @@ import { mirrorPath, moveTree, pathExists } from './fsx.ts';
 import { newJournalId, type Journal, type JournalEntry, type RemoteSteps } from './journal.ts';
 import { HostStepError, undoOnHost, type HostRunner, type HostTarget } from './ssh-host.ts';
 
+/**
+ * The parts of a journal entry the caller decides when an operation starts:
+ * mode, the action expected so far, title, root uuid, both ends and the
+ * relation found, and for a restore the id of the entry it undoes.
+ * OperationLog fills in the rest (id, start time, status, step lists).
+ */
 export type OperationFields = Pick<JournalEntry, 'mode' | 'action' | 'title' | 'rootUuid' | 'source' | 'target' | 'relation'> & {
   restores?: string;
 };
 
+/**
+ * Where an OperationLog writes and what it may use: the journal, the backups
+ * root, the start time, and the host runner for undoing host steps in a
+ * rollback.
+ */
 export interface OperationLogOptions {
   journal: Journal;
   /** <dataDir>/backups; this operation's mirror goes into <backupsDir>/<journal id>. */
@@ -33,6 +44,12 @@ export interface OperationLogOptions {
   host?: HostRunner | undefined;
 }
 
+/**
+ * The bookkeeping of one write operation (operations.ts): it opens the
+ * journal entry, records each step before it happens (a backup once it is
+ * complete), keeps the backup mirror under <backupsDir>/<journal id>,
+ * closes the entry, and can roll back what it did so far.
+ */
 export class OperationLog {
   readonly entry: JournalEntry;
   private readonly backupDir: string;

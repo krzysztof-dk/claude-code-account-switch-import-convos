@@ -40,6 +40,11 @@ import type { Paths } from './paths.ts';
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Result of looking for a process: running, not-running, or unknown when
+ * pgrep could not list processes at all. For the live directory, writeGate
+ * refuses writing on unknown just as on running.
+ */
 export type AppStatus = 'running' | 'not-running' | 'unknown';
 
 /** The Electron main process of the desktop app is named exactly "Claude". */
@@ -90,12 +95,19 @@ export function pgrepArgvArgs(pattern: string): string[] {
   return ['-a', '-l', '-f', pattern];
 }
 
+/** One process that blocks writing, as a refusal names it: its pid and what it is called. */
 export interface ProcessMatch {
   pid: number;
   /** The process name, or the first argument of a process found by its argument list. */
   command: string;
 }
 
+/**
+ * What one lookup found, for the desktop app or for the CLI: the status and
+ * the matching processes. detectProcess and detectClaudeCli build it,
+ * writeGate turns a list of them into a decision, and the TUI start screen
+ * shows them.
+ */
 export interface ProcessDetection {
   /** What was looked for, as shown to the person: "Claude" (the app) or "claude" (the CLI). */
   label: string;
@@ -168,6 +180,11 @@ export async function detectClaudeProcesses(): Promise<ProcessDetection[]> {
   return Promise.all([detectProcess(APP_PROCESS_NAME), detectClaudeCli()]);
 }
 
+/**
+ * Whether the tool may write right now. Operations ask for one before every
+ * write and once more before the record; when writing is not allowed,
+ * `reason` is the message shown to the person.
+ */
 export interface WriteGate {
   allowed: boolean;
   /** Shown to the person when writes are refused. */
@@ -209,6 +226,13 @@ export function writeGate(paths: Paths, detections: readonly ProcessDetection[])
 /** A gate to call right before each write; skips process detection for copied directories. */
 export type Guard = () => Promise<WriteGate>;
 
+/**
+ * The guard the operations, the CLI and the TUI call right before each
+ * write. For a copied directory (tests, --user-data rehearsals) it allows
+ * writing without looking at processes; for the live directory it detects
+ * the app and the CLI again on every call, so a process started meanwhile
+ * is noticed.
+ */
 export function makeGuard(paths: Paths): Guard {
   return async () => (paths.liveUserData ? writeGate(paths, await detectClaudeProcesses()) : { allowed: true, reason: null });
 }
