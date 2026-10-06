@@ -660,11 +660,27 @@ function isEntryPoint(): boolean {
   }
 }
 
+/**
+ * Lets the process end once the work is done although standard input is
+ * still open. The prompt library listens for key presses on standard input,
+ * and a pipe (a script, a test) keeps the event loop alive after the last
+ * screen; a terminal does not. Found by the TUI tests of 2026-10-06: the
+ * process stayed alive after "Bye." until its stdin was closed. Pausing
+ * and unreferencing the stream lets the loop drain and exit with the code
+ * set below; a stdin that is a file has no unref and needs none.
+ */
+function detachStdin(): void {
+  const stdin = process.stdin as NodeJS.ReadStream & { unref?: () => void };
+  stdin.pause();
+  stdin.unref?.();
+}
+
 if (isEntryPoint()) {
   const io: Io = { out: (text) => process.stdout.write(text), err: (text) => process.stderr.write(text) };
   main(process.argv.slice(2), io).then(
     (code) => {
       process.exitCode = code;
+      detachStdin();
     },
     (error: unknown) => {
       io.err(`fatal: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);

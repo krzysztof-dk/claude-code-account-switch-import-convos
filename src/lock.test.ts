@@ -1,9 +1,15 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
+import { promisify } from 'node:util';
+import { pathExists } from './fsx.ts';
 import { LOCK_FILE_NAME, LockHeldError, acquireLock } from './lock.ts';
+import { packageRoot } from './paths.ts';
+
+const execFileAsync = promisify(execFile);
 
 /** A pid no process on macOS can have (pids stop at 99998). */
 const DEAD_PID = 4194303;
@@ -70,6 +76,22 @@ describe('lock', () => {
     const lock = await acquireLock(dir, () => false);
     assert.equal(lock.takenOverFrom?.pid, DEAD_PID);
     await lock.release();
+  });
+
+  it('removes its lock when the process exits without releasing it', async () => {
+    // The prompt library ends the process with process.exit(0) on Ctrl+C
+    // during a spinner (lock.ts header), so the lock has an exit listener
+    // while it is held, and none once released.
+    const dir = path.join(root, 'exit');
+    const before = process.listenerCount('exit');
+    const lock = await acquireLock(dir);
+    assert.equal(process.listenerCount('exit'), before + 1);
+    await lock.release();
+    assert.equal(process.listenerCount('exit'), before);
+    // A child that takes the lock and calls process.exit leaves no file behind.
+    const script = "import('./src/lock.ts').then(async (m) => { await m.acquireLock(process.argv[1]); process.exit(0); })";
+    await execFileAsync(process.execPath, ['--input-type=module', '-e', script, dir], { cwd: packageRoot() });
+    assert.equal(await pathExists(path.join(dir, LOCK_FILE_NAME)), false, 'the exit listener removed the lock');
   });
 
   it('release leaves a lock that another process took over meanwhile', async () => {

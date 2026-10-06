@@ -155,13 +155,16 @@ class Tui {
 
   /**
    * Picks Quit (the last entry of the main menu) and expects the goodbye and
-   * exit code 0. `menuShown` says the caller already waited for this menu.
+   * exit code 0 with standard input still open: the process used to stay
+   * alive until the pipe was closed (found by these tests on 2026-10-06,
+   * fixed in cli.ts, detachStdin). `menuShown` says the caller already
+   * waited for this menu.
    */
   async quit(menuShown = false): Promise<void> {
     if (!menuShown) await this.waitFor('What next?');
     this.child.stdin.write(KEY.up + KEY.enter);
     await this.waitFor('Bye.');
-    assert.equal(await this.finish(), 0, this.stderr);
+    assert.equal(await this.exitCode(), 0, this.stderr);
   }
 }
 

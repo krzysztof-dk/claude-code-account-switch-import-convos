@@ -19,6 +19,15 @@
 // counts as alive, as in app-guard.ts: not knowing is not permission. Two
 // processes finding the same dead lock race for it; the loser's exclusive
 // create fails and it reads the winner's live pid on its second attempt.
+//
+// The lock is also removed when the process exits without reaching the
+// finally block: the prompt library ends the process with process.exit(0)
+// on Ctrl+C while a spinner runs (found by the TUI tests of 2026-10-06,
+// @clack/core, block()). An "exit" listener removes the file
+// synchronously, since nothing asynchronous runs after that event; the
+// journal entry of an operation cut short that way stays "running" and the
+// next run asks about it, as after any interruption.
+import { readFileSync, rmSync } from 'node:fs';
 import { mkdir, open, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { processAlive } from './app-guard.ts';
@@ -55,14 +64,37 @@ export interface Lock {
   release(): Promise<void>;
 }
 
-/** The content of a lock file, or null when it is missing, torn or not a lock. */
-async function readLock(file: string): Promise<LockInfo | null> {
+/** The lock a file's text describes, or null when the text is torn or not a lock. */
+function parseLock(text: string): LockInfo | null {
   try {
-    const parsed = JSON.parse(await readFile(file, 'utf8')) as { pid?: unknown; startedAt?: unknown } | null;
+    const parsed = JSON.parse(text) as { pid?: unknown; startedAt?: unknown } | null;
     if (parsed === null || typeof parsed !== 'object' || typeof parsed.pid !== 'number' || !Number.isInteger(parsed.pid) || parsed.pid <= 0) return null;
     return { pid: parsed.pid, startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : 'an unknown time' };
   } catch {
     return null;
+  }
+}
+
+/** The content of a lock file, or null when it is missing, torn or not a lock. */
+async function readLock(file: string): Promise<LockInfo | null> {
+  try {
+    return parseLock(await readFile(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Removes the lock file when this process still owns it, synchronously, so
+ * it can run from an "exit" listener; a lock another process took over
+ * meanwhile is left alone. Errors are swallowed: at exit there is nobody
+ * to tell, and a lock left behind is taken over by the next run anyway.
+ */
+function releaseSync(file: string): void {
+  try {
+    if (parseLock(readFileSync(file, 'utf8'))?.pid === process.pid) rmSync(file, { force: true });
+  } catch {
+    // Gone or unreadable: nothing to release.
   }
 }
 
@@ -86,10 +118,14 @@ export async function acquireLock(dataDir: string, isAlive: (pid: number) => boo
       } finally {
         await handle.close();
       }
+      // Belt and braces for an exit that skips the finally block (see the header).
+      const atExit = (): void => releaseSync(file);
+      process.once('exit', atExit);
       return {
         file,
         takenOverFrom,
         async release() {
+          process.off('exit', atExit);
           const current = await readLock(file);
           if (current?.pid === process.pid) await rm(file, { force: true });
         },

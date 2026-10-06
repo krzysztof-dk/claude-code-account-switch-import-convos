@@ -5,3 +5,5 @@ backups/
 .DS_Store
 *.log
 .vscode/
+# The local Claude Code directory of this checkout: linked worktrees, write tracking, settings; never part of the project.
+.claude/
