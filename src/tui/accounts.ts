@@ -8,6 +8,13 @@ import { ACCOUNT_HEADER, accountRow, renderTable } from '../format.ts';
 import { extractEmail } from '../transcripts.ts';
 import type { TuiContext } from './context.ts';
 
+/**
+ * The "Accounts" screen: the table of accounts, then a loop of picking one
+ * and giving it a name, clearing the name or (only when no source knows
+ * it) typing its e-mail. Every change is saved to accounts.json at once and
+ * the inventory is rebuilt, so the lists elsewhere show the new label.
+ * Returns when the person chooses Back or cancels.
+ */
 export async function accountsFlow(context: TuiContext): Promise<void> {
   for (;;) {
     const accounts = context.inventory.accounts;

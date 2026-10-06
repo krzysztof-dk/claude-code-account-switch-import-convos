@@ -69,6 +69,14 @@ function stateCounts(assessments: readonly SyncAssessment[]): string {
   return [...counts].map(([label, count]) => `${count} ${label}`).join(', ');
 }
 
+/**
+ * The "Transfer conversations" screen, start to finish: source, target,
+ * scope, the picker, the mode, a decision per conflicting conversation, the
+ * dry-run plan (which looks at the SSH hosts, read only), the guard, the
+ * interrupted-operation check, the confirmation, the real run and a
+ * rescan. Returns early, with nothing written, whenever the person cancels
+ * a prompt, the guard refuses, or the TUI runs as a dry run.
+ */
 export async function transferFlow(context: TuiContext): Promise<void> {
   const inventory = context.inventory;
   if (inventory.accounts.length === 0) {

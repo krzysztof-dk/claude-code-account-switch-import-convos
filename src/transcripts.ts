@@ -52,6 +52,11 @@ import { pipeline } from 'node:stream/promises';
 import { isDirectory, tempPathFor } from './fsx.ts';
 import { isUuid } from './records.ts';
 
+/**
+ * Where a transcript is on disk, as found by locateTranscript or
+ * listTranscripts: the inventory keeps one per conversation, operations
+ * copy from it, and the summary cache keys on its path, size and time.
+ */
 export interface TranscriptLocation {
   cliSessionId: string;
   /** Absolute path of the .jsonl file. */
@@ -107,6 +112,7 @@ export function isSshMirror(location: Pick<TranscriptLocation, 'projectDir' | 'c
  */
 export const SESSION_KEYED_DIRS = ['file-history', 'uploads', 'image-cache'] as const;
 
+/** One of SESSION_KEYED_DIRS; the only directory names ever joined to a session id on this machine or in a host script. */
 export type SessionKeyedDirName = (typeof SESSION_KEYED_DIRS)[number];
 
 /** The directories of SESSION_KEYED_DIRS a session has under a CLI directory, by name, with their absolute paths. */
@@ -131,6 +137,13 @@ export async function copySessionKeyedDir(source: string, destination: string): 
   await cp(source, destination, { recursive: true, errorOnExist: true, force: false });
 }
 
+/**
+ * What the bridge-session lines of a transcript say about Remote Control:
+ * which account on claude.ai owned the sessions and which claude.ai
+ * sessions were ever linked. Part of TranscriptSummary; the inventory reads
+ * the owner for the origin and the e-mail votes, operations read the ids to
+ * tell links inherited from the source from ones made on the target.
+ */
 export interface BridgeInfo {
   /** Account and organization on the claude.ai side, from the last bridge-session line. */
   ownerAccountId: string | null;
@@ -138,6 +151,12 @@ export interface BridgeInfo {
   bridgeSessionIds: string[];
 }
 
+/**
+ * Everything the tool needs to know about a transcript without reading it
+ * again: produced by summarizeTranscript in one pass, cached by
+ * summary-cache.ts, carried on every Conversation (inventory.ts) and
+ * compared between a conversation and its copy (compare.ts, the uuid chain).
+ */
 export interface TranscriptSummary {
   /** First uuid in file order, shown and selectable; a fork shares it with its parent. Null for files without any uuid. */
   rootUuid: string | null;

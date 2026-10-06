@@ -7,6 +7,7 @@ import type { JournalEntry } from '../journal.ts';
 import { restoreEntry, type OperationContext } from '../operations.ts';
 import type { TuiContext } from './context.ts';
 
+/** What the person decided about the interrupted operations, for the caller to continue, rescan or stop. */
 export interface InterruptedAnswer {
   /** exit: the person chose to stop, or undoing failed. */
   choice: 'continue' | 'exit';

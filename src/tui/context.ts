@@ -10,6 +10,13 @@ import type { LineageStore } from '../lineage.ts';
 import type { Paths } from '../paths.ts';
 import type { SummaryCache } from '../summary-cache.ts';
 
+/**
+ * What every screen of the TUI works with: the open session (paths and the
+ * tool's stores), the inventory as last scanned, the guard, the dry-run
+ * flag and the warnings shown in the Environment box. Built once by runTui
+ * (tui/index.ts) and passed to each flow; `reload()` refreshes the parts
+ * that change when files do.
+ */
 export interface TuiContext {
   paths: Paths;
   store: AccountStore;

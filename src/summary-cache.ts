@@ -20,6 +20,11 @@ interface CacheEntry {
   summary: TranscriptSummary;
 }
 
+/**
+ * The cache of transcript summaries (see the header), loaded once per run
+ * by cli.ts and the TUI, consulted and filled by the inventory
+ * (inventory.ts, summarize) and saved at the end of the inventory build.
+ */
 export class SummaryCache {
   private readonly file: string;
   private readonly entries: Map<string, CacheEntry>;

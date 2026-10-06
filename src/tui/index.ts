@@ -23,6 +23,7 @@ import { settleInterruptedInTui } from './interrupted.ts';
 import { restoreFlow } from './restore.ts';
 import { transferFlow } from './transfer.ts';
 
+/** The open session the command line hands to the TUI (cli.ts, openSession): the resolved paths and the tool's own stores. */
 export interface TuiSession {
   paths: Paths;
   store: AccountStore;
@@ -31,6 +32,7 @@ export interface TuiSession {
   lineage: LineageStore;
 }
 
+/** How the TUI is started (`ccas` with or without --dry-run). */
 export interface TuiOptions {
   /** Show plans only, never write; useful for a rehearsal. */
   dryRun?: boolean | undefined;
@@ -82,6 +84,14 @@ function describeEnvironment(context: TuiContext): string {
   return lines.join('\n');
 }
 
+/**
+ * The interactive mode: scans the directories, shows the Environment box
+ * (directories, running app and CLI, version drift), settles interrupted
+ * operations, then loops over the main menu until Quit. Returns the exit
+ * code for cli.ts: 0, or EXIT_INTERRUPTED when the person chose Exit at the
+ * question about an interrupted operation. The data directory lock is
+ * taken by cli.ts around this call, not here.
+ */
 export async function runTui(session: TuiSession, options: TuiOptions = {}): Promise<number> {
   const dryRun = options.dryRun === true;
   p.intro(`${pc.bgCyan(pc.black(' ccas '))} Claude Code conversations between accounts${dryRun ? pc.yellow('  (dry run)') : ''}`);

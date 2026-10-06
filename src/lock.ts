@@ -23,6 +23,7 @@ import { mkdir, open, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { processAlive } from './app-guard.ts';
 
+/** Name of the lock file inside the data directory; the README names it for the person who has to remove a leftover by hand. */
 export const LOCK_FILE_NAME = 'lock';
 
 /** What the lock file holds about its owner. */

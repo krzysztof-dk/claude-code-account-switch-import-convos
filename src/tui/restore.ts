@@ -11,6 +11,13 @@ import { settleInterruptedInTui } from './interrupted.ts';
 /** done, failed half-way, or interrupted and left as it was: all can still be undone. */
 const RESTORABLE = new Set(['done', 'failed', 'resolved']);
 
+/**
+ * The "Restore from journal" screen: lists the operations that can still
+ * be undone (newest first), shows the dry-run plan of the chosen one, asks
+ * for confirmation, undoes it and rescans. Interrupted operations are not
+ * offered here (settleInterruptedInTui deals with them first), and a dry
+ * run TUI stops after the plan.
+ */
 export async function restoreFlow(context: TuiContext): Promise<void> {
   const entries = (await context.journal.list()).filter((entry) => RESTORABLE.has(entry.status) && entry.mode !== 'restore').reverse();
   if (entries.length === 0) {

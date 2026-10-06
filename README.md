@@ -97,10 +97,10 @@ nvm use
 6. Check that nothing runs:
 
 ```bash
-node -e "import('./src/app-guard.ts').then(async m => console.log(JSON.stringify(await m.detectClaudeProcesses(), null, 2)))"
+node -e "import('./src/app-guard.ts').then(async m => console.log(JSON.stringify(await m.detectClaudeProcesses(require('node:os').homedir() + '/.claude'), null, 2)))"
 ```
 
-   Expected: `"status": "not-running"` for `Claude` and for `claude`.
+   Expected: `"status": "not-running"` for `Claude` and for `claude`. A `claude` entry that mentions "from its session file" names a CLI session the CLI's own index still lists (see "Safety"); quit that session, or, when it crashed earlier, start and quit `claude` once so the CLI clears the leftover.
 
 7. If some of the conversations run over SSH, check that the host answers without asking anything:
 
@@ -183,6 +183,8 @@ npm start
 | `FAILED` for some conversations (exit code 3) | those conversations were not copied, the rest were | read the reason on the `FAILED` line; `npm start -- restore <id>` with the `[journal <id>]` of that line cleans up what is left; running the command again finishes the copying, and conversations already copied report "up to date" |
 | `FAILED ... could not reach <host> over ssh` | `ssh` cannot connect to the host without a prompt; nothing was written | do step 7 of "Before you start", then run the command again |
 | `FAILED ... <host> has no transcript <id>.jsonl` | the original is not on the host (deleted, or another host), so a copy could not be resumed there; nothing was written | look at `~/.claude/projects` on the host; the original cannot be resumed either |
+| `error: another ccas is running (PID ...)` (exit code 1) | a second ccas holds the lock on `data/` | wait for it, or remove `data/lock` when that process is gone |
+| `warning: the Claude app is X, newer than Y, the version whose record fields this tool was checked against` | the app (or the CLI) was updated since this tool was last checked against it | copies still work; the `accounts` command lists record fields the tool does not know, see "Development" for how to check them |
 | in the app, in a copied SSH conversation: "Claude couldn't process that message" and "Session history unavailable" | a copy made before 2026-09-28 has no transcript on the host | do not click "Start fresh"; quit the app and run the same copy command again (see "Repairing older copies") |
 | you want to undo the copying | every conversation is a separate journal entry | `npm start -- journal` lists the entries, `npm start -- restore <id>` undoes one |
 
@@ -192,6 +194,8 @@ npm start
 - Do not delete `data/lineage.json`: it is how the tool knows what it has copied already.
 - Copies of SSH conversations are full conversations: you can continue them on the target account, on the same host. From the moment of copying, the original and the copy are independent.
 - Copied and moved conversations have Remote Control switched off; you switch it on in the app, per conversation.
+- A copy carries the conversation's checkpoints (`/rewind` works in it) and its Remote Control attachments, on this Mac and on the SSH host.
+- Only one ccas writes at a time: the TUI, `transfer`, `restore` and `resolve` take a lock on `data/`; a dry run and the read-only commands do not.
 
 ## Commands
 
@@ -242,7 +246,7 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | success |
-| 1 | usage error or another error (also a selector that does not match exactly one conversation) |
+| 1 | usage error or another error (also a selector that does not match exactly one conversation, or another ccas holding the lock) |
 | 2 | writing refused: the app or a `claude` process runs (also when it appeared during the operation, which was then rolled back), or that could not be checked |
 | 3 | part of a transfer failed |
 | 4 | an interrupted operation needs `restore` or `resolve` |
@@ -258,8 +262,12 @@ Found from the files on disk and the code of `Claude.app`:
 | what the ids mean | the first level is the account uuid, the second the organization uuid (`lastKnownAccountUuid` in the app's `config.json` names the account) |
 | transcripts (the content of conversations) | `~/.claude/projects/<encoded project dir>/<cliSessionId>.jsonl`, plus a sidecar directory `<cliSessionId>/` with tool results and sub-agent transcripts |
 | local mirror of an SSH session | `~/.claude/projects/ssh-<cliSessionId>/<cliSessionId>.jsonl`, plus flat sub-agent files `agent-<hex>.jsonl` in the same directory |
+| per-session directories outside `projects/` (documented by Claude Code under "Claude directory") | `~/.claude/file-history/<cliSessionId>/` (the pre-edit snapshots `/rewind` restores from), `~/.claude/uploads/<cliSessionId>/` (attachments of Remote Control sessions, referred to by path from the transcript), `~/.claude/image-cache/<cliSessionId>/`; for an SSH conversation they are on the host |
+| the CLI's index of running sessions | `~/.claude/sessions/<pid>.json`, one file per running CLI process, removed when it exits; files of sessions that crashed stay until the next launch |
 
-A record is a small JSON file (id, `cliSessionId`, project directory, title, dates, model). A transcript is a file with one JSON object per line, shared by all accounts, because the CLI has a single `~/.claude` directory. The app reads records only at start-up and when switching accounts, always fresh from disk, and writes them when they change and when it quits. It writes only the fields it knows: a field added by another tool is gone the first time the app saves the record.
+A record is a small JSON file (id, `cliSessionId`, project directory, title, dates, model, and about 160 further fields in Claude.app 2.19675.0). A transcript is a file with one JSON object per line, shared by all accounts, because the CLI has a single `~/.claude` directory. The app reads records only at start-up and when switching accounts, always fresh from disk, and writes them when they change and when it quits. It writes only the fields it knows: a field added by another tool is gone the first time the app saves the record. The app also promotes a file named `local_<uuid>.json.tmp` (younger than 30 days) to a record when the record is missing or unreadable, which is why this tool's temporary files never end in `.json.tmp`.
+
+What the tool knows about these files was read from the files themselves and from the code of Claude.app 2.19675.0 and CLI 2.1.286 (checked 2026-10-05). Claude Code documents the transcript directory, the per-session directories and the session index, and says the line format is internal and changes between versions; the records, the SSH mirrors and the Remote Control lines in transcripts are not documented. The tool therefore warns when the installed app or CLI is newer than the versions it was checked against (see "Development").
 
 Conversations driven from claude.ai through Remote Control, and sessions started from a terminal, have no record on any account, only a transcript. The tool shows them as the source "No account" and can import them.
 
@@ -281,8 +289,8 @@ Content is compared only for a linked pair. Every message line of a transcript h
 
 | Operation | The target account has no copy | The target account has a linked copy |
 |---|---|---|
-| Copy (sync) | a copy is made with a new `sessionId` and a new `cliSessionId`, its own transcript and sidecar directory (for SSH: its own mirror and its own transcript on the host) | the copy is brought up to date with the source (transcript, sidecar directory, record); the target keeps its ids |
-| Move | the record file changes directory; ids and transcript stay as they are | as above, then the record, transcript and sidecar directory of the source go into the backup |
+| Copy (sync) | a copy is made with a new `sessionId` and a new `cliSessionId`, its own transcript, sidecar directory and per-session directories (for SSH: its own mirror, and its own transcript and per-session directories on the host) | the copy is brought up to date with the source (transcript, sidecar directory, per-session directories, record); the target keeps its ids |
+| Move | the record file changes directory; ids and transcript stay as they are | as above, then the record, transcript, sidecar directory and per-session directories of the source go into the backup |
 | Import (source "No account") | like Copy; the original transcript is not touched | like Copy |
 
 Every operation switches Remote Control off in the conversation it transfers (see "Remote Control").
@@ -301,12 +309,25 @@ The record of a copy loses the fields that tie it to the live state of the sourc
 | claude.ai | `bridgeSessionIds`, `remoteControlSpawn`, `cloudSessionId` | the claude.ai sessions belong to the original |
 | earlier transcripts | `priorCliSessionIds`, `unarchivedCliSessionId`, `preClearCliSessionId` | a copy has only its own transcript |
 | sending on its own | `interruptedByQuitAt`, `interruptedUnseenResume`, `armedWorkAtQuit`, `pendingFirstStart` | the app would resume work or start a queued task by itself |
+| the account itself (app 2.19675.0) | `emailAddress` | names the source account |
+| claude.ai things of the source account | `publishedArtifacts`, `cloudSpawnedTasks`, `movedToCloud` | artifacts and cloud tasks live under that account on claude.ai |
+| other sessions of the source account | `peerInbound`, `peerReceipts`, `dispatchParentId`, `dispatchParentOrigin`, `forkedFromSessionId`, `forkedAtMessageUuid`, `lineageDetached` | peers, the session that dispatched this one and the fork lineage all name records of the source account |
+| the app's importer and index | `importedFrom`, `indexedAt`, `resumeConfirmed`, `stagedTranscriptPath`, `transcriptUnavailable` | history of the source with the app; a staged transcript path would make the app read the transcript from elsewhere |
+| organization resources | `envScopeId`, `startedFromEnvironmentId`, `spaceId`, `scheduledTaskId`, `scheduledRunContinued` | cloud environments, spaces and scheduled tasks of the source's organization |
+
+Every field the record serializer of Claude.app 2.19675.0 writes is in one of three lists in `src/records.ts`: dropped from copies (the table above), Remote Control (switched off, see below) or kept. A record field in none of them is reported by `accounts`, `list` and `transfer` ("fields this tool does not know"); it is most likely new in a newer app, and copies carry it as it is until the lists are updated.
 
 The app's `waiting-input/` directory is not copied: restored for an SSH session, it could make the app send on its own.
 
 Whether a conversation is archived is decided by the `isArchived` field of its record, which a copy keeps. The file `archived-sessions.idx` (`{"v":1,"archived":["local_..."]}`) is only a hint for the order the app loads records in; the app rewrites it itself, so the tool leaves it alone.
 
 A record without a transcript is an entry in the side panel too. Copy then makes a copy of the record alone, with new ids and without the source-bound fields.
+
+### Per-session directories
+
+Besides the transcript, the CLI keeps three directories per session outside `projects/`, each named after the CLI session id: `file-history/<id>/` with the pre-edit snapshots `/rewind` restores from (without them a rewind ends with "No files were restored"), `uploads/<id>/` with the attachments a Remote Control session refers to by path, and `image-cache/<id>/`. A copy gets each of them that the original has, under its new id: on this Mac for a local conversation, on the host for an SSH conversation (next to the host's own, before the transcript is put in place). The files inside carry no session id, so they are copied as they are. An update replaces them (the old ones go into the backup), a move takes the source's along into the backup, and `restore` puts everything back.
+
+Not copied, on purpose: `session-env/<id>` and `tasks/<id>` (state of a CLI process, not of the conversation), `debug/<id>.txt`, `dev-mods/<id>`, `history.jsonl` (the prompt history, which names sessions but belongs to the machine) and the scratchpad under `/private/tmp/claude-<uid>/`. The CLI deletes all of these together with the transcript after `cleanupPeriodDays` anyway.
 
 ### States
 
@@ -341,6 +362,7 @@ The mirror is for display only. The conversation is run by the CLI on the host: 
 ```
 <host>:~/.claude/projects/<encoded dir>/<new id>.jsonl   the original's transcript with the id replaced, ending with a line that switches Remote Control off
 <host>:~/.claude/projects/<encoded dir>/<new id>/        the original's sidecar directory, with the id replaced in names and in .json/.jsonl files
+<host>:~/.claude/file-history/<new id>/                  the original's per-session directories, copied as they are (also uploads/ and image-cache/)
 ```
 
 Without that transcript the CLI on the host fails with "No conversation found with session ID", the app shows "Claude couldn't process that message" and "Session history unavailable", removes the `cliSessionId` from the copy's record, and the history disappears from view. That is what happened to copies made before 2026-09-28.
@@ -350,7 +372,8 @@ How it works:
 - The tool connects to the host with the system `ssh` and the values from `sshConfig` (host, port, key), in batch mode (`BatchMode=yes`). `ssh <host> true` must work in Terminal.app without asking for a password: the key in the agent, the host key known.
 - On the host it runs an `sh` script given on standard input (`sh -s`), so the host's login shell has nothing to interpret. The original is found by its id under `~/.claude/projects` on the host (or under `CLAUDE_CONFIG_DIR`).
 - The copy on the host is made by replacing the id in the host's original, byte for byte. The app extends a mirror with the bytes of the host file past the mirror's length, so a mirror must be an exact prefix of the host file. The copy's mirror is made from the original's mirror, which is a prefix of the original on the host, and the id has a fixed length, so this holds. Whatever the host has beyond the mirror reaches the mirror with the next sync.
-- The transcript is moved into place last, under a name that cannot exist yet (`ln`), so the CLI cannot resume the copy before it is complete.
+- Everything is built under temporary names first; the per-session directories go into place before the sidecar directory, and the transcript last, under a name that cannot exist yet (`ln`), so the CLI cannot resume the copy before everything it refers to is complete.
+- The host name and key path from the record, and every path the host reports back, are checked before they reach `ssh` or a script (a host name never starts with `-`, a reported path is absolute and free of control characters).
 - A dry run connects to the host too, but only reads.
 - When the host cannot be reached or does not have the original, the copy of the SSH conversation is not made: the operation is rolled back and reported as `FAILED` with the reason. A copy that would break the first time it is used is never made.
 - Changes on the host are journaled like local ones. `restore` sets created files aside as `<file>.ccas-removed-<id>`, and replaced ones (after an update) come back from `<file>.ccas-backup-<id>`. The CLI ignores names that do not end in `.jsonl`. Nothing on the host is deleted.
@@ -411,7 +434,7 @@ When no source knows the address, the TUI lets you type it. Every account can ge
 
 ### The stamp on records
 
-Every record the tool creates, updates or moves gets a `ccas` field that says where it came from and how many lines the source transcript had at that moment. The app drops that field the first time it saves the record, because it writes only the fields it knows, so the stamp is only a hint until then. The lasting record of where copies came from is `data/lineage.json`: it tells the tool which conversation is a copy of which, and it keeps e-mails from inherited `session_context` lines from counting as evidence for the target account.
+Every record the tool creates, updates or moves gets a `ccas` field that says where it came from and how many lines the source transcript had at that moment. The app drops that field the first time it saves the record, because it writes only the fields it knows, so the stamp is only a hint until then. The lasting record of where copies came from is `data/lineage.json`: it tells the tool which conversation is a copy of which, and it keeps e-mails from inherited `session_context` lines from counting as evidence for the target account. Moves write a link there as well (the record keeps its id, so the link only marks the line count of the move): without it, a moved conversation whose stamp the app had dropped made the source account's e-mail vote for the target account.
 
 ## Interrupted operations
 
@@ -440,11 +463,15 @@ Without a terminal (a script, a pipe) the tool does not ask: it ends with exit c
   | `.../.claude/remote/ccd-cli/<version>` | the CLI the app installs on an SSH host (SSH sessions from another computer) |
   | `.../claude.app/Contents/MacOS/claude` | the CLI built into the app (its process is also named `claude`) |
 
+  | `node .../node_modules/@anthropic-ai/claude-code/cli.js` | the CLI installed with npm, which runs as `node` |
+
   The server the app starts on an SSH host (`~/.claude/remote/srv/<hash>/server`) does not block writing by itself; the CLI processes it starts do.
+- The CLI's own index of running sessions (`~/.claude/sessions/<pid>.json`, one file per running CLI process) is read as well, so a CLI is found whatever its binary is called. A file whose pid is dead is a leftover of a crashed session and is ignored; a pid that another process reused after a crash counts as running until the next CLI launch clears the file, and the refusal names the file so you can tell.
 - When the process list cannot be read (for example in the sandbox of a Claude Code session), writing is refused. Run the tool in Terminal.app.
+- One ccas at a time: the TUI, `transfer`, `restore` and `resolve` hold `data/lock` (the pid inside) while they run. A second one refuses with the holder's pid; the lock of a process that is gone is taken over with a warning.
 - The steps on an SSH host do not wait for SSH sessions on that host to end: they only create new files next to the original and move the transcript into place last.
-- Every file is written through a temporary file and `rename`. Nothing is deleted: removing means moving into `data/backups/<operation id>/`, keeping the full path. Copied transcripts and directories get the permission bits of their source, records 0600, as the app writes them.
-- Every operation has an entry in `data/journal.jsonl` (what was created, moved and backed up), written before each step. `restore <id>` reverses an entry and is itself an entry, so a restore can be undone too.
+- Every file is written through a temporary file and `rename`. Nothing is deleted: removing means moving into `data/backups/<operation id>/`, keeping the full path. Copied transcripts and directories get the permission bits of their source, records 0600, as the app writes them. The tool's own `data/` and `data/backups/` are 0700 and its state files 0600: the summary cache holds the first prompt and the e-mails of every transcript on the machine.
+- Every operation has an entry in `data/journal.jsonl` (what was created, moved and backed up), written before each step and flushed to the disk together with its directory entry. `restore <id>` reverses an entry and is itself an entry, so a restore can be undone too.
 - `--dry-run` and the "Plan" screen of the TUI show the effects without touching files.
 - Transcripts are processed as streams, multi-megabyte ones included. A multi-byte character cut by a read-block boundary is put back together, so a copy is byte for byte identical to the original apart from the session id.
 
@@ -457,6 +484,7 @@ Without a terminal (a script, a pipe) the tool does not ask: it ends with exit c
 | `journal.jsonl` | the operation journal |
 | `summary-cache.json` | transcript summaries, so later runs do not read hundreds of megabytes again |
 | `backups/` | backups, one directory per operation |
+| `lock` | the pid of the ccas that is writing right now; removed when it finishes |
 
 The directory is in `.gitignore`.
 
@@ -468,8 +496,11 @@ The directory is in `.gitignore`.
 - Copying an SSH conversation needs `ssh` access to the host, without a prompt, at the time of copying (see "SSH sessions"). An SSH transcript without a record (an import from "No account") has no host recorded, so its copy gets no transcript on the host and is for reading only.
 - Moving an SSH conversation does not remove its transcript from the host; the backup covers only the files on this Mac.
 - Links are direct: a copy of a copy (A -> B -> C) is not linked to the original on account A.
-- The CLI installed through npm runs as `node .../claude`. It is not detected unless it names its process `claude`. The native installer and the CLI built into the app are detected.
-- Two tool processes running at the same time are not supported.
+- An imported transcript of a terminal session is subject to the CLI's cleanup: Claude Code deletes transcripts older than `cleanupPeriodDays` (30 days by default) unless the session was started or last continued in the desktop app, so a copy that is never opened in the app can disappear after a month, leaving its record without a transcript.
+- The app itself looks for desktop transcripts that lost their record and offers to adopt them. After an import from "No account" the original is still such a transcript, so the app may adopt it on the account that ran it; the copy and the adopted original are then two conversations.
+- A copy keeps the message uuids of the original (the tool compares them to find out whether a copy is up to date). The Agent SDK's own fork gives the copied messages new uuids; nothing documented depends on the difference, and copies resume as checked live.
+- The record carries a snapshot of the system prompt the CLI recorded for the source account (the `session_context` lines); the CLI replaces it when the conversation is continued on the new account.
+- The app's own importer (for sessions of a previous profile or another organization) and this tool do not know about each other.
 - Whether the app shows a record built from a transcript without a record still needs a live check.
 
 ## Development
@@ -486,15 +517,17 @@ npm test
 npm run build
 ```
 
-`npm test` runs the tests with Node's own runner (`node:test`). The tests build a throw-away world: a fake app directory with two accounts, a fake `~/.claude` with transcripts shaped like real ones (SSH mirrors with a multi-byte character on the 64 KiB boundary included), a fake SSH host (a home directory with its own `~/.claude`) and a data directory for the tool. The host scripts really run, through `sh -s` on the fake host's directory; in the tests of the CLI process `CCAS_SSH` points at `test/fake-ssh.sh`, which refuses to run without that directory, so no test can touch the real `~/.claude`. `src/cli.test.ts` runs the real CLI process on that world. Two tests in `app-guard.test.ts` need the process list; where `pgrep` cannot read it (the Claude Code sandbox) they are skipped with the reason.
+`npm test` runs the tests with Node's own runner (`node:test`); `node --test src/fsx.test.ts` runs one file. The tests build a throw-away world: a fake app directory with two accounts, a fake `~/.claude` with transcripts shaped like real ones (SSH mirrors with a multi-byte character on the 64 KiB boundary included, per-session directories), a fake SSH host (a home directory with its own `~/.claude`) and a data directory for the tool. The host scripts really run, through `sh -s` on the fake host's directory; in the tests of the CLI process `CCAS_SSH` points at `test/fake-ssh.sh`, which refuses to run without that directory, so no test can touch the real `~/.claude`. `src/cli.test.ts` runs the real CLI process on that world, and the TUI is driven through a pipe (clack reads key presses from standard input also when it is not a terminal). Every module in `src/` has a test file of its own name; `test/fixtures.ts` holds the builders. Two tests in `app-guard.test.ts` need the process list; where `pgrep` cannot read it (the Claude Code sandbox) they are skipped with the reason, and so is the cross-volume move in `fsx.test.ts` when the temporary directory and the repository share a volume.
+
+The tool's knowledge of the app's and the CLI's files was checked against Claude.app 2.19675.0 and CLI 2.1.286 on 2026-10-05 (`VERIFIED_AGAINST` in `src/versions.ts`). After an app update: run `npm start -- accounts` and look for "fields this tool does not know"; sort each such field into `SOURCE_BOUND_FIELDS` or `KNOWN_RECORD_FIELDS` in `src/records.ts` and add it to the serializer list in `src/records.test.ts`, then raise `VERIFIED_AGAINST`. After a CLI update: check that `SESSION_KEYED_DIRS` (`src/transcripts.ts`) and the shape of `~/.claude/sessions/<pid>.json` (`src/app-guard.ts`) still hold.
 
 Modules in `src/`:
 
 | Module | Role |
 |---|---|
 | `paths.ts` | directories of the app, the CLI and the tool, overrides |
-| `records.ts` | `local_*.json` records: validation as in the app, references to transcripts, fields that tie a copy to its source, switching Remote Control off, atomic writes |
-| `transcripts.ts` | finding and summarising transcripts, SSH mirrors, copies with the id replaced, sidecar directories, lines that switch Remote Control off |
+| `records.ts` | `local_*.json` records: validation as in the app, references to transcripts, the three field lists (dropped, Remote Control, kept) and the audit of unknown fields, switching Remote Control off, atomic writes |
+| `transcripts.ts` | finding and summarising transcripts, SSH mirrors, copies with the id replaced, sidecar directories, per-session directories, lines that switch Remote Control off |
 | `ssh-host.ts` | work on the SSH host: `ssh` in batch mode, reading the host's state, the copy of the transcript next to the original, switching Remote Control off, undo |
 | `compare.ts` | how two uuid lists relate, consistency checks |
 | `accounts.ts` | finding accounts, sources of the e-mail, `accounts.json` |
@@ -503,5 +536,7 @@ Modules in `src/`:
 | `operation-log.ts` | the journal entry and backups of one operation, written ahead of each step |
 | `interrupted.ts`, `tui/interrupted.ts` | interrupted operations: description, instructions, the question |
 | `journal.ts`, `lineage.ts`, `summary-cache.ts` | the tool's state |
-| `app-guard.ts` | detecting a running app and CLI processes |
+| `app-guard.ts` | detecting a running app and CLI processes, through the process list and the CLI's session index |
+| `lock.ts` | one writing ccas at a time per data directory |
+| `versions.ts` | the app and CLI versions the tool was checked against, and the warning when the installed ones are newer |
 | `cli.ts`, `format.ts`, `tui/` | commands, formatting, interactive screens |
