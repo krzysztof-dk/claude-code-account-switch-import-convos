@@ -562,6 +562,10 @@ export async function copySidecar(sourceDir: string, destinationDir: string, fro
   await mkdir(destinationDir, { recursive: true, mode: await permissionsOf(sourceDir) });
   const entries = await readdir(sourceDir, { withFileTypes: true });
   for (const entry of entries) {
+    // .cc-writes is a directory the Claude Code desktop harness keeps next to
+    // files it edits (its own write tracking), not part of the conversation;
+    // seen inside side folders on 2026-10-05 and left out of copies since.
+    if (entry.name === '.cc-writes') continue;
     const sourcePath = path.join(sourceDir, entry.name);
     const destinationPath = path.join(destinationDir, entry.name.split(from).join(to));
     if (entry.isDirectory()) {

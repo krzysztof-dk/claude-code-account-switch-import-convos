@@ -98,6 +98,12 @@ describe('formatSize', () => {
     assert.equal(formatSize(1.5 * 1024 * 1024), '1.5 MB');
     assert.equal(formatSize(300 * 1024 * 1024), '300.0 MB');
   });
+
+  it('rounds before choosing the unit, so just under 1 MiB is not "1024 KB"', () => {
+    // Found by the audit of 2026-10-05: 1048575 bytes showed as 1024 KB.
+    assert.equal(formatSize(1024 * 1024 - 1), '1.0 MB');
+    assert.equal(formatSize(1023 * 1024 + 511), '1023 KB');
+  });
 });
 
 describe('shortenPath', () => {
@@ -182,6 +188,15 @@ describe('renderTable', () => {
       ['longer name', 'n', ''],
     ]);
     for (const line of text.split('\n')) assert.doesNotMatch(line, / $/, JSON.stringify(line));
+  });
+
+  it('leaves no trailing spaces on the dashed line either, when the last header cell is empty', () => {
+    // Found by the audit of 2026-10-05: the dashed line was the one line not trimmed.
+    const text = renderTable([
+      ['name', ''],
+      ['x', 'y'],
+    ]);
+    assert.equal(text, ['name', '----  -', 'x     y'].join('\n'));
   });
 });
 

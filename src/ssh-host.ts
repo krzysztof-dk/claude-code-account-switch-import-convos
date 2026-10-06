@@ -129,12 +129,28 @@ export class HostStepError extends Error {
 }
 
 /**
+ * Destinations as the app stores them and ssh accepts them: a host name, an
+ * alias from ~/.ssh/config, user@host, an IPv6 literal in brackets, an
+ * ssh:// URL. The first character is never "-", so a value read from a
+ * record can never turn into an ssh option even without the "--" that
+ * precedes it, and spaces and control characters are refused as well
+ * (added 2026-10-05, review: defence in depth for values that come from
+ * files).
+ */
+const HOST_RE = /^[A-Za-z0-9[][A-Za-z0-9._@:%[\]/-]*$/;
+
+/**
  * Arguments for ssh. BatchMode makes a missing key or an unknown host key an
  * error instead of a prompt nobody answers (the script arrives on standard
  * input, so ssh could not ask there anyway); the keepalive options end a
- * connection to a host that went away instead of hanging.
+ * connection to a host that went away instead of hanging. Throws for a
+ * host or key path that does not look like one (see HOST_RE).
  */
 export function sshArguments(target: HostTarget): string[] {
+  if (!HOST_RE.test(target.host)) throw new Error(`refusing to pass ${JSON.stringify(target.host)} to ssh as a host`);
+  if (target.identityFile !== undefined && (target.identityFile.startsWith('-') || /[\n\r\0]/.test(target.identityFile))) {
+    throw new Error(`refusing to pass ${JSON.stringify(target.identityFile)} to ssh as a key file`);
+  }
   return [
     '-o',
     'BatchMode=yes',
@@ -159,7 +175,14 @@ const OUTPUT_LIMIT = 1024 * 1024;
 export function sshRunner(program: string = process.env['CCAS_SSH'] || 'ssh'): HostRunner {
   return (target, script) =>
     new Promise((resolve, reject) => {
-      const child = spawn(program, sshArguments(target), { stdio: ['pipe', 'pipe', 'pipe'] });
+      let args: string[];
+      try {
+        args = sshArguments(target);
+      } catch (error) {
+        reject(new HostStepError(target, 'failed', (error as Error).message));
+        return;
+      }
+      const child = spawn(program, args, { stdio: ['pipe', 'pipe', 'pipe'] });
       let stdout = '';
       let stderr = '';
       child.stdout.setEncoding('utf8');
@@ -398,19 +421,34 @@ function failureOf(target: HostTarget, result: HostRunResult, doing: string): Ho
   return new HostStepError(target, kind, `${doing} on ${describeHost(target)} failed (exit ${result.code ?? 'by signal'}${said ? `: ${said}` : ''})`);
 }
 
+/**
+ * A path the host reported, checked before it is reused in a later script
+ * or in a journal: absolute and free of control characters. Anything else
+ * means the probe output is not what this tool wrote, and the step stops
+ * (added 2026-10-05, review: defence in depth, the output comes over ssh).
+ */
+function hostPath(target: HostTarget, value: string | null, what: string): string | null {
+  if (value === null) return null;
+  if (!value.startsWith('/') || /[\n\r\0]/.test(value)) {
+    throw new HostStepError(target, 'failed', `${describeHost(target)} reported an unusable ${what}: ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
 /** Looks at the host without changing anything (probeScript). */
 export async function probeHost(runner: HostRunner, target: HostTarget, request: ProbeRequest): Promise<HostProbe> {
   const result = await runner(target, probeScript(request));
   if (result.code !== 0 || !hasMarker(result.stdout, 'CCAS_OK')) throw failureOf(target, result, 'looking for the transcripts');
+  const dirNames = (marker: string): string[] => markerValues(result.stdout, marker).filter((name) => (SESSION_KEYED_DIRS as readonly string[]).includes(name));
   return {
-    dir: markerValues(result.stdout, 'CCAS_DIR').at(0) ?? null,
+    dir: hostPath(target, markerValues(result.stdout, 'CCAS_DIR').at(0) ?? null, 'folder'),
     sourceSidecar: hasMarker(result.stdout, 'CCAS_SOURCE_SIDECAR'),
-    target: markerValues(result.stdout, 'CCAS_TARGET').at(0) ?? null,
-    targetSidecar: markerValues(result.stdout, 'CCAS_TARGET_SIDECAR').at(0) ?? null,
+    target: hostPath(target, markerValues(result.stdout, 'CCAS_TARGET').at(0) ?? null, 'transcript path'),
+    targetSidecar: hostPath(target, markerValues(result.stdout, 'CCAS_TARGET_SIDECAR').at(0) ?? null, 'side folder path'),
     targetLive: markerValues(result.stdout, 'CCAS_TARGET_LIVE'),
-    claudeDir: markerValues(result.stdout, 'CCAS_CLAUDE_DIR').at(0) ?? null,
-    sourceDirs: markerValues(result.stdout, 'CCAS_SOURCE_DIR'),
-    targetDirs: markerValues(result.stdout, 'CCAS_TARGET_DIR'),
+    claudeDir: hostPath(target, markerValues(result.stdout, 'CCAS_CLAUDE_DIR').at(0) ?? null, 'Claude directory'),
+    sourceDirs: dirNames('CCAS_SOURCE_DIR'),
+    targetDirs: dirNames('CCAS_TARGET_DIR'),
   };
 }
 

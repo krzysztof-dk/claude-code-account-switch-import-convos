@@ -19,6 +19,8 @@ export interface TuiContext {
   inventory: Inventory;
   /** The app and the CLI as found at start-up, shown for information only. */
   processes: ProcessDetection[];
+  /** Warnings about an app or CLI newer than the versions this tool was checked against (versions.ts), shown in the Environment box. */
+  drift: string[];
   guard: Guard;
   /** Rehearsal mode (ccas --dry-run): every screen stops after showing its plan. */
   dryRun: boolean;

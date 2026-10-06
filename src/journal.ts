@@ -160,7 +160,8 @@ export class Journal {
   }
 
   async append(entry: JournalEntry): Promise<void> {
-    await appendFileDurable(this.file, `${JSON.stringify(entry)}\n`);
+    // Private (0600): the journal names conversations by title and path.
+    await appendFileDurable(this.file, `${JSON.stringify(entry)}\n`, { mode: 0o600, syncDir: true });
   }
 
   /** Replaces the entry with the same id; the file is small, so it is rewritten whole. */
@@ -169,7 +170,7 @@ export class Journal {
     const index = entries.findIndex((candidate) => candidate.id === entry.id);
     if (index === -1) entries.push(entry);
     else entries[index] = entry;
-    await writeFileAtomic(this.file, entries.map((candidate) => JSON.stringify(candidate)).join('\n') + '\n', { sync: true });
+    await writeFileAtomic(this.file, entries.map((candidate) => JSON.stringify(candidate)).join('\n') + '\n', { sync: true, syncDir: true, mode: 0o600 });
   }
 
   /**

@@ -57,7 +57,9 @@ export class SummaryCache {
   async save(): Promise<void> {
     if (!this.dirty) return;
     const data = { version: CACHE_VERSION, entries: Object.fromEntries(this.entries) };
-    await writeFileAtomic(this.file, JSON.stringify(data));
+    // Private (0600): a summary carries the first prompt and the e-mails of
+    // every transcript on the machine, whichever account they belong to.
+    await writeFileAtomic(this.file, JSON.stringify(data), { mode: 0o600 });
     this.dirty = false;
   }
 }

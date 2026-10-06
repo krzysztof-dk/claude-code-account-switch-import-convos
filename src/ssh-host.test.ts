@@ -262,4 +262,31 @@ describe('ssh host', () => {
     // A per-session directory name comes from the probe's output; only the three the CLI keeps are ever used in a script.
     await assert.rejects(() => copyOnHost(run, TARGET, { ...plain, sourceCliSessionId: id, targetCliSessionId: randomUUID(), dirs: ['../projects'] }), /refusing/);
   });
+
+  it('refuses a host or key path that could be an ssh option, before ssh runs', async () => {
+    // The values come from the record's sshConfig, a file; "--" before the
+    // host protects against options, the check protects against everything
+    // else that is not a destination (spaces, control characters).
+    assert.throws(() => sshArguments({ host: '-oProxyCommand=evil' }), /refusing/);
+    assert.throws(() => sshArguments({ host: 'mini local' }), /refusing/);
+    assert.throws(() => sshArguments({ host: 'mini\nlocal' }), /refusing/);
+    assert.throws(() => sshArguments({ host: 'mini', identityFile: '-F/etc/ssh_config' }), /refusing/);
+    for (const host of ['mini', 'build@mini.local', '[::1]', 'user@[fe80::1%en0]', 'ssh://build@mini.local:2222', 'mini-2.local', '10.0.0.5']) {
+      assert.ok(sshArguments({ host }).includes(host), host);
+    }
+    await assert.rejects(
+      () => probeHost(sshRunner(FAKE_SSH), { host: '-oProxyCommand=evil' }, { sourceCliSessionId: randomUUID(), targetCliSessionId: randomUUID() }),
+      (error: unknown) => error instanceof HostStepError && error.kind === 'failed' && /refusing/.test(error.message),
+    );
+  });
+
+  it('trusts a path the host reports only when it is absolute and clean, and a directory name only when the CLI keeps it', async () => {
+    const request = { sourceCliSessionId: randomUUID(), targetCliSessionId: randomUUID() };
+    const relative: HostRunner = async () => ({ code: 0, stdout: 'CCAS_CLAUDE_DIR:relative/dir\nCCAS_OK\n', stderr: '' });
+    await assert.rejects(() => probeHost(relative, TARGET, request), /unusable Claude directory/);
+    const control: HostRunner = async () => ({ code: 0, stdout: 'CCAS_CLAUDE_DIR:/home/x/.claude\nCCAS_DIR:/home/x/.claude/projects/p\rx\nCCAS_OK\n', stderr: '' });
+    await assert.rejects(() => probeHost(control, TARGET, request), /unusable folder/);
+    const foreign: HostRunner = async () => ({ code: 0, stdout: 'CCAS_CLAUDE_DIR:/home/x/.claude\nCCAS_SOURCE_DIR:../projects\nCCAS_SOURCE_DIR:uploads\nCCAS_OK\n', stderr: '' });
+    assert.deepEqual((await probeHost(foreign, TARGET, request)).sourceDirs, ['uploads']);
+  });
 });

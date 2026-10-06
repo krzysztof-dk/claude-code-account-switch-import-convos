@@ -112,7 +112,7 @@ export class LineageStore {
   /** Adds a link and flushes the file to the disk before returning, like the journal. */
   async add(link: LineageLink): Promise<void> {
     this.links.push(link);
-    await writeFileAtomic(this.file, `${JSON.stringify({ version: 1, links: this.links }, null, 2)}\n`, { sync: true });
+    await writeFileAtomic(this.file, `${JSON.stringify({ version: 1, links: this.links }, null, 2)}\n`, { sync: true, syncDir: true, mode: 0o600 });
   }
 
   byRoot(rootUuid: string): LineageLink[] {

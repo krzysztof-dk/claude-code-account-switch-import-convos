@@ -22,7 +22,11 @@ export function formatWhen(ms: number | null): string {
  */
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  // Found by the audit of 2026-10-05 (format.test.ts): 1048575 bytes showed
+  // as "1024 KB", the unit chosen before the rounding. Rounding first keeps
+  // the unit consistent with the number shown.
+  const kb = Math.round(bytes / 1024);
+  if (kb < 1024) return `${kb} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
@@ -56,7 +60,9 @@ export function renderTable(rows: readonly (readonly string[])[], header = true)
     row.map((cell, index) => cell.padEnd(widths[index] ?? cell.length)).join('  ').trimEnd();
   const lines = rows.map(line);
   if (header && rows.length > 1) {
-    lines.splice(1, 0, widths.map((width) => '-'.repeat(width)).join('  '));
+    // Trimmed like the rows: found by the audit of 2026-10-05, the dashed
+    // line kept trailing spaces when the last header cell was empty.
+    lines.splice(1, 0, widths.map((width) => '-'.repeat(width)).join('  ').trimEnd());
   }
   return lines.join('\n');
 }

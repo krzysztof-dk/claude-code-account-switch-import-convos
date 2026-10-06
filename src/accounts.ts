@@ -190,7 +190,8 @@ export class AccountStore {
 
   async save(): Promise<void> {
     const data: AccountsFile = { version: 1, accounts: this.accounts };
-    await writeFileAtomic(this.file, `${JSON.stringify(data, null, 2)}\n`);
+    // Private (0600): the file holds the e-mail addresses of the accounts.
+    await writeFileAtomic(this.file, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
   }
 
   all(): readonly StoredAccount[] {

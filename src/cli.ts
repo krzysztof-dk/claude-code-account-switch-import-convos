@@ -34,6 +34,9 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { AccountStore, accountKey, accountLabel, matchAccount, type AccountDir, type AccountInfo } from './accounts.ts';
 import { GuardRefusal, makeGuard } from './app-guard.ts';
+import { ensurePrivateDir } from './fsx.ts';
+import { LockHeldError, acquireLock } from './lock.ts';
+import { driftOf } from './versions.ts';
 import { ACCOUNT_HEADER, accountRow, describeComparison, describeFlags, describeOrigin, describeState, formatSize, formatWhen, renderTable, shortenPath, truncate } from './format.ts';
 import { interruptedHelp } from './interrupted.ts';
 import { assessSync, buildInventory, conversationsOf, type Conversation, type Inventory } from './inventory.ts';
@@ -125,6 +128,9 @@ function inventoryOf(session: Session): ReturnType<typeof buildInventory> {
 }
 
 async function openSession(paths: Paths): Promise<Session> {
+  // The tool's own state is private to this user (fsx.ts, ensurePrivateDir).
+  await ensurePrivateDir(paths.dataDir);
+  await ensurePrivateDir(paths.backupsDir);
   return {
     paths,
     store: await AccountStore.load(paths.dataDir),
@@ -276,14 +282,15 @@ export function summaryLine(tally: ReadonlyMap<OutcomeAction, number>, excluded:
 /** Builds the transfer items for a batch, resolving conflicts with one policy. */
 export function planTransfers(
   inventory: Inventory,
-  source: AccountDir | null,
   target: AccountInfo,
   conversations: readonly Conversation[],
   mode: TransferMode,
   onConflict: ConflictPolicy,
 ): TransferItem[] {
+  // The source account used to be a parameter here, unused since the
+  // conversations are passed in already chosen; dropped in the review of
+  // 2026-10-05, found while reading the command module.
   const targetConversations = conversationsOf(inventory, target);
-  void source;
   return conversations.map((conversation) => ({
     source: conversation,
     target,
@@ -338,19 +345,49 @@ async function runAccounts(session: Session, io: Io, json: boolean): Promise<num
   }
   io.out(`${renderTable([ACCOUNT_HEADER, ...inventory.accounts.map(accountRow)])}\n`);
   io.out(`unlisted transcripts (no record on any account): ${inventory.unlisted.length}\n`);
-  warnProblems(inventory, io);
+  await warnAbout(inventory, io);
   return EXIT_OK;
 }
 
-/** Problems the inventory found (unreadable records, fields this tool does not know), as warnings on stderr. */
-function warnProblems(inventory: Inventory, io: Io): void {
+/**
+ * What the inventory found worth a warning, on stderr: unreadable records,
+ * record fields this tool does not know (records.ts, unknownFields), and an
+ * app or CLI newer than the versions this tool was checked against
+ * (versions.ts).
+ */
+async function warnAbout(inventory: Inventory, io: Io): Promise<void> {
   for (const problem of inventory.problems) io.err(`warning: ${problem}\n`);
+  for (const warning of await driftOf(inventory)) io.err(`warning: ${warning}\n`);
+}
+
+/**
+ * Runs a command that writes into the tool's data directory under its lock
+ * (lock.ts): a lock held by a live ccas is an error with that process named,
+ * the lock of a dead one is taken over with a note.
+ */
+async function underLock(session: Session, io: Io, run: () => Promise<number>): Promise<number> {
+  let lock;
+  try {
+    lock = await acquireLock(session.paths.dataDir);
+  } catch (error) {
+    if (!(error instanceof LockHeldError)) throw error;
+    io.err(`error: ${error.message}\n`);
+    return EXIT_USAGE;
+  }
+  if (lock.takenOverFrom) {
+    io.err(`warning: took over the lock of ccas PID ${lock.takenOverFrom.pid} (since ${lock.takenOverFrom.startedAt}), which is no longer running\n`);
+  }
+  try {
+    return await run();
+  } finally {
+    await lock.release();
+  }
 }
 
 async function runList(session: Session, io: Io, from: string, to: string | undefined, json: boolean): Promise<number> {
   const inventory = await inventoryOf(session);
   await warnInterrupted(session, io);
-  warnProblems(inventory, io);
+  await warnAbout(inventory, io);
   const source = accountOrNone(inventory, from);
   const target = to === undefined ? null : matchAccount(inventory.accounts, to);
   const conversations = conversationsOf(inventory, source);
@@ -384,8 +421,8 @@ interface TransferOptions {
 interface TransferPlan {
   items: TransferItem[];
   excluded: Conversation[];
-  /** What the inventory found wrong or unknown while reading (printed as warnings before the plan). */
-  problems: string[];
+  /** The inventory the plan was made from, for the warnings printed before the plan (warnAbout). */
+  inventory: Inventory;
 }
 
 /**
@@ -403,7 +440,7 @@ async function planTransfer(session: Session, options: TransferOptions): Promise
   const chosen = options.all
     ? pool.filter((conversation) => !excluded.includes(conversation))
     : [...new Set(options.sessions.map((selector) => findConversation(pool, selector)))];
-  return { excluded, items: planTransfers(inventory, source, target, chosen, options.mode, options.onConflict), problems: inventory.problems };
+  return { excluded, items: planTransfers(inventory, target, chosen, options.mode, options.onConflict), inventory };
 }
 
 async function runTransfer(session: Session, io: Io, options: TransferOptions): Promise<number> {
@@ -424,7 +461,7 @@ async function runTransfer(session: Session, io: Io, options: TransferOptions): 
   }
 
   const prefix = options.dryRun ? '[dry-run] ' : '';
-  for (const problem of plan.problems) io.err(`warning: ${problem}\n`);
+  await warnAbout(plan.inventory, io);
   for (const conversation of plan.excluded) io.out(`${prefix}excluded "${truncate(conversation.title, 60)}" (${conversationId(conversation)})\n`);
   const context = { paths: session.paths, journal: session.journal, lineage: session.lineage, dryRun: options.dryRun };
   const tally = new Map<OutcomeAction, number>();
@@ -555,7 +592,9 @@ export async function main(argv: string[], io: Io): Promise<number> {
     switch (command) {
       case undefined: {
         const { runTui } = await import('./tui/index.ts');
-        return runTui(session, { dryRun: values['dry-run'] === true });
+        const dryRun = values['dry-run'] === true;
+        // The TUI holds the lock for as long as it is open, since it can write at any point.
+        return dryRun ? await runTui(session, { dryRun }) : await underLock(session, io, () => runTui(session, { dryRun }));
       }
       case 'accounts':
         return await runAccounts(session, io, values.json === true);
@@ -573,7 +612,7 @@ export async function main(argv: string[], io: Io): Promise<number> {
         if (all && sessions.length > 0) throw new Error('--all and --session cannot be combined');
         if (!all && excludes.length > 0) throw new Error('--exclude only works together with --all');
         if (!all && sessions.length === 0) throw new Error('transfer needs --all or at least one --session <id>');
-        return await runTransfer(session, io, {
+        const options: TransferOptions = {
           from: values.from,
           to: values.to,
           mode: values.mode,
@@ -582,19 +621,21 @@ export async function main(argv: string[], io: Io): Promise<number> {
           excludes,
           onConflict,
           dryRun: values['dry-run'] === true,
-        });
+        };
+        return options.dryRun ? await runTransfer(session, io, options) : await underLock(session, io, () => runTransfer(session, io, options));
       }
       case 'journal':
         return await runJournal(session, io, values.json === true);
       case 'restore': {
         const id = positionals[1];
         if (!id) throw new Error('restore needs a journal id');
-        return await runRestore(session, io, id, values['dry-run'] === true);
+        const dryRun = values['dry-run'] === true;
+        return dryRun ? await runRestore(session, io, id, dryRun) : await underLock(session, io, () => runRestore(session, io, id, dryRun));
       }
       case 'resolve': {
         const id = positionals[1];
         if (!id) throw new Error('resolve needs a journal id');
-        return await runResolve(session, io, id);
+        return await underLock(session, io, () => runResolve(session, io, id));
       }
       default:
         io.err(`unknown command "${command}"\n${USAGE}`);

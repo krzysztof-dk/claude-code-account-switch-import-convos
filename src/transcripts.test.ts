@@ -228,4 +228,19 @@ describe('transcripts', () => {
     assert.ok(result.includes(written.cliId));
     assert.equal(JSON.parse(await readFile(path.join(sidecar, 'custom-title.json'), 'utf8')).customTitle, 'T');
   });
+
+  it('leaves the desktop harness write-tracking directory out of a side folder copy', async () => {
+    // .cc-writes is kept by the Claude Code desktop harness next to files it
+    // edits; seen inside side folders on 2026-10-05, it is not part of the
+    // conversation and never reaches a copy.
+    const written = await writeTranscript(world, { prompts: 1 });
+    await mkdir(path.join(written.sidecarDir, '.cc-writes'), { recursive: true });
+    await writeFile(path.join(written.sidecarDir, '.cc-writes', 'lease'), 'x');
+    const to = '44444444-4444-4444-8444-444444444444';
+    const sidecar = path.join(written.projectDir, to);
+    await copySidecar(written.sidecarDir, sidecar, written.cliId, to);
+    const copied = await readTree(sidecar);
+    assert.ok([...copied.keys()].every((name) => !name.includes('.cc-writes')), [...copied.keys()].join(', '));
+    assert.ok(copied.has(path.join('tool-results', 'result1.txt')));
+  });
 });

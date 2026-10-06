@@ -16,6 +16,7 @@ import type { Journal } from '../journal.ts';
 import type { LineageStore } from '../lineage.ts';
 import type { Paths } from '../paths.ts';
 import type { SummaryCache } from '../summary-cache.ts';
+import { driftOf } from '../versions.ts';
 import { accountsFlow } from './accounts.ts';
 import type { TuiContext } from './context.ts';
 import { settleInterruptedInTui } from './interrupted.ts';
@@ -35,7 +36,7 @@ export interface TuiOptions {
   dryRun?: boolean | undefined;
 }
 
-async function scan(context: Omit<TuiContext, 'inventory' | 'reload'>): Promise<TuiContext['inventory']> {
+async function scan(context: Omit<TuiContext, 'inventory' | 'reload' | 'drift'>): Promise<TuiContext['inventory']> {
   const spinner = p.spinner();
   spinner.start('Scanning');
   const inventory = await buildInventory(context.paths, {
@@ -77,6 +78,7 @@ function describeEnvironment(context: TuiContext): string {
   ];
   if (context.dryRun) lines.push(pc.yellow('dry run: plans are shown, nothing is written'));
   for (const detection of context.processes) lines.push(describeDetection(detection, context.paths.liveUserData));
+  for (const warning of context.drift) lines.push(pc.yellow(warning));
   return lines.join('\n');
 }
 
@@ -88,10 +90,13 @@ export async function runTui(session: TuiSession, options: TuiOptions = {}): Pro
   const context: TuiContext = {
     ...base,
     inventory: await scan(base),
+    drift: [],
     async reload() {
       context.inventory = await scan(base);
+      context.drift = await driftOf(context.inventory);
     },
   };
+  context.drift = await driftOf(context.inventory);
   p.note(describeEnvironment(context), 'Environment');
   if ((await settleInterruptedInTui(context)) === 'exit') {
     p.outro('Nothing more was changed.');
