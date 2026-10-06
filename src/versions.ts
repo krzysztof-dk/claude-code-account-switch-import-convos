@@ -22,8 +22,14 @@
 import { readFile } from 'node:fs/promises';
 import type { Inventory } from './inventory.ts';
 
-/** The versions whose files, fields and directories were checked on 2026-10-05. */
-export const VERIFIED_AGAINST = { app: '2.19675.0', cli: '2.1.286' } as const;
+/**
+ * The versions whose files, fields and directories were checked on
+ * 2026-10-05 (app 2.19675.0, CLI 2.1.286). The app updated itself to
+ * 2.19675.1 on 2026-10-06, during the same review; its record serializer
+ * writes the same 161 fields (checked by the same extraction from
+ * app.asar), so that is the version recorded here.
+ */
+export const VERIFIED_AGAINST = { app: '2.19675.1', cli: '2.1.286' } as const;
 
 /** Where the desktop app lives on macOS; its Info.plist carries the version. */
 export const APP_INFO_PLIST = '/Applications/Claude.app/Contents/Info.plist';

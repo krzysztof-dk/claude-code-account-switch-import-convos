@@ -26,9 +26,10 @@ import {
 /**
  * The top-level keys of the record serializer in Claude.app 2.19675.0, read
  * from app.asar on 2026-10-05 (the object literal that starts with
- * sessionId and cliSessionId; 161 keys). When a newer app version adds a
- * field, add it here and sort it into SOURCE_BOUND_FIELDS or
- * KNOWN_RECORD_FIELDS; the test below names what is missing.
+ * sessionId and cliSessionId; 161 keys), the same in 2.19675.1 (checked
+ * 2026-10-06). When a newer app version adds a field, add it here and sort
+ * it into SOURCE_BOUND_FIELDS or KNOWN_RECORD_FIELDS; the test below names
+ * what is missing.
  */
 const SERIALIZER_FIELDS_2_19675 = `
   sessionId cliSessionId cwd originCwd worktreePath worktreeName worktreeLazy worktreePinned gitAnchors
