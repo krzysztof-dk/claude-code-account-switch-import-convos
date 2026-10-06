@@ -5,6 +5,8 @@ import { after, before, describe, it } from 'node:test';
 import { ACCOUNT_A, ACCOUNT_B, EMAIL_A, EMAIL_B, destroyWorld, makeWorld, type World } from '../test/fixtures.ts';
 import {
   AccountStore,
+  accountKey,
+  accountLabel,
   discoverAccountDirs,
   matchAccount,
   readCliOauthAccount,
@@ -109,5 +111,18 @@ describe('accounts', () => {
     assert.throws(() => matchAccount(accounts, ''), /empty/);
     const twins: AccountInfo[] = [accounts[0]!, { ...accounts[0]!, orgId: ACCOUNT_B.orgId, name: null }];
     assert.throws(() => matchAccount(twins, 'aaaaaaaa'), /ambiguous/);
+  });
+
+  it('labels an account by its name, else its e-mail, else the start of its uuid', () => {
+    const base = { accountId: ACCOUNT_A.accountId, name: 'Work', email: EMAIL_A };
+    assert.equal(accountLabel(base), 'Work');
+    assert.equal(accountLabel({ ...base, name: null }), EMAIL_A);
+    // Eight characters of a uuid are enough to tell accounts apart by eye; the dots say it is cut.
+    assert.equal(accountLabel({ ...base, name: null, email: null }), 'aaaaaaaa...');
+  });
+
+  it('keys an account directory as accountId/orgId, the form a person may type to name it', () => {
+    assert.equal(accountKey(ACCOUNT_A.accountId, ACCOUNT_A.orgId), `${ACCOUNT_A.accountId}/${ACCOUNT_A.orgId}`);
+    assert.notEqual(accountKey(ACCOUNT_A.accountId, ACCOUNT_B.orgId), accountKey(ACCOUNT_A.accountId, ACCOUNT_A.orgId), 'one account in two organizations is two keys');
   });
 });

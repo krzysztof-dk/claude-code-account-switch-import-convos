@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { describe, it } from 'node:test';
-import { resolvePaths } from './paths.ts';
+import { defaultUserData, resolvePaths } from './paths.ts';
 
 describe('resolvePaths', () => {
   it('uses the desktop app and CLI defaults under the home directory', () => {
@@ -33,5 +33,14 @@ describe('resolvePaths', () => {
     assert.equal(paths.userData, '/tmp/copy');
     assert.equal(paths.cliConfigFile, '/tmp/cli/.claude.json');
     assert.equal(paths.dataDir, '/tmp/data');
+  });
+});
+
+describe('defaultUserData', () => {
+  it('is the app directory under Application Support of the given home', () => {
+    assert.equal(defaultUserData('/Users/me'), '/Users/me/Library/Application Support/Claude');
+    assert.equal(defaultUserData('/Users/other/'), '/Users/other/Library/Application Support/Claude');
+    // resolvePaths falls back to it, and calls exactly that directory the live one.
+    assert.equal(resolvePaths({ home: '/Users/me', env: {} }).userData, defaultUserData('/Users/me'));
   });
 });

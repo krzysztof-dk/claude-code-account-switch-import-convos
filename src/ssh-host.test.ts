@@ -8,15 +8,19 @@ import { pathExists } from './fsx.ts';
 import {
   HostStepError,
   copyOnHost,
+  copyScript,
   describeHost,
   hostCopyPaths,
   hostTargetOf,
   probeHost,
+  probeScript,
   shQuote,
   sshArguments,
   sshRunner,
   tombstoneOnHost,
+  tombstoneScript,
   undoOnHost,
+  undoScript,
   type HostCopyRequest,
   type HostRunner,
   type HostTarget,
@@ -288,5 +292,112 @@ describe('ssh host', () => {
     await assert.rejects(() => probeHost(control, TARGET, request), /unusable folder/);
     const foreign: HostRunner = async () => ({ code: 0, stdout: 'CCAS_CLAUDE_DIR:/home/x/.claude\nCCAS_SOURCE_DIR:../projects\nCCAS_SOURCE_DIR:uploads\nCCAS_OK\n', stderr: '' });
     assert.deepEqual((await probeHost(foreign, TARGET, request)).sourceDirs, ['uploads']);
+  });
+});
+
+describe('ssh host: the scripts as text', () => {
+  // The scripts are plain functions of their request, so their shape can be
+  // checked without a host: the prelude every script relies on, quoting of
+  // every value that comes from a record, a probe or a journal, and the order
+  // of the steps where the order is the safety property.
+  const ID = '11111111-1111-4111-8111-111111111111';
+  const COPY = '22222222-2222-4222-8222-222222222222';
+  const QUOTED_DIR = "/Users/build/.claude/projects/-Users-build-it's a dir";
+  const scripts = (): Record<string, string> => ({
+    probe: probeScript({ sourceCliSessionId: ID, targetCliSessionId: COPY, hint: `${QUOTED_DIR}/${ID}.jsonl` }),
+    copy: copyScript({ dir: QUOTED_DIR, claudeDir: "/Users/build/o'clock/.claude", sourceCliSessionId: ID, targetCliSessionId: COPY, dirs: [], existingDirs: [] }),
+    tombstone: tombstoneScript(`${QUOTED_DIR}/${ID}.jsonl`),
+    undo: undoScript({ created: [`${QUOTED_DIR}/${COPY}.jsonl`], moved: [{ from: `${QUOTED_DIR}/x`, to: `${QUOTED_DIR}/x.ccas-backup-J1` }], tag: 'R1' }),
+  });
+
+  it('starts every script with the prelude: unset variables stop it, files are private, bytes are bytes', () => {
+    for (const [name, script] of Object.entries(scripts())) {
+      assert.deepEqual(script.split('\n').slice(0, 3), ['set -u', 'umask 077', 'LC_ALL=C'], name);
+    }
+  });
+
+  it('quotes every value in single quotes, a single quote inside as \'\\\'\'', () => {
+    const quotedDir = `'/Users/build/.claude/projects/-Users-build-it'\\''s a dir`;
+    const { probe, copy, tombstone, undo } = scripts();
+    assert.ok(probe!.includes(`OLD='${ID}'`) && probe!.includes(`NEW='${COPY}'`), probe);
+    assert.ok(probe!.includes(`HINT=${quotedDir}/${ID}.jsonl'`), probe);
+    assert.ok(copy!.includes(`D=${quotedDir}'`), copy);
+    assert.ok(copy!.includes(`K='/Users/build/o'\\''clock/.claude'`), copy);
+    assert.ok(copy!.includes(`TAG=''`), 'no tag is an empty quoted value');
+    assert.ok(tombstone!.includes(`F=${quotedDir}/${ID}.jsonl'`), tombstone);
+    assert.ok(undo!.includes(`X=${quotedDir}/${COPY}.jsonl'`), undo);
+    assert.ok(undo!.includes(`TO=${quotedDir}/x.ccas-backup-J1'`) && undo!.includes(`TAG='R1'`), undo);
+    // No raw value outside quotes: the quote-bearing directory never appears bare.
+    for (const script of [probe!, copy!, tombstone!, undo!]) assert.ok(!script.includes("it's a dir"), script);
+  });
+
+  it('puts the per-session directories into place before the side folder, and the transcript last', () => {
+    const script = copyScript({ dir: '/h/p', claudeDir: '/h/.claude', sourceCliSessionId: ID, targetCliSessionId: COPY, dirs: ['file-history', 'uploads'], existingDirs: [] });
+    assert.ok(script.includes('TD0="$K/file-history/$NEW"') && script.includes('TD1="$K/uploads/$NEW"'), script);
+    const announced = [...script.matchAll(/echo "CCAS_CREATED:(\$\w+)"/g)].map((match) => match[1]);
+    assert.deepEqual(announced, ['$TD0', '$TD1', '$SN', '$F']);
+  });
+
+  it('undoes created paths newest first, then moves the kept ones back newest first', () => {
+    const script = undoScript({
+      created: ['/h/first', '/h/second', '/h/third'],
+      moved: [
+        { from: '/h/a', to: '/h/a.ccas-backup-J' },
+        { from: '/h/b', to: '/h/b.ccas-backup-J' },
+      ],
+      tag: 'R7',
+    });
+    const created = [...script.matchAll(/^X='([^']*)'$/gm)].map((match) => match[1]);
+    assert.deepEqual(created, ['/h/third', '/h/second', '/h/first']);
+    const movedBack = [...script.matchAll(/^FROM='([^']*)'$/gm)].map((match) => match[1]);
+    assert.deepEqual(movedBack, ['/h/b', '/h/a']);
+    assert.ok(script.lastIndexOf("X='/h/first'") < script.indexOf("FROM='/h/b'"), 'every created path goes before any move back');
+  });
+});
+
+describe('ssh host: the tombstone and undo scripts on awkward paths', () => {
+  let world: World;
+  let run: HostRunner;
+  /** A folder with spaces and single quotes in its name. */
+  let dir: string;
+
+  before(async () => {
+    world = await makeWorld();
+    const home = path.join(world.root, 'host');
+    dir = path.join(home, '.claude', 'projects', "it's got 'quotes' and spaces");
+    await mkdir(dir, { recursive: true });
+    run = localHostRunner(home);
+  });
+  after(async () => {
+    await destroyWorld(world);
+  });
+
+  it('appends the tombstone to a transcript whose path has spaces and quotes', async () => {
+    const id = randomUUID();
+    const transcript = path.join(dir, `${id} copy's.jsonl`);
+    const live = `${JSON.stringify({ type: 'bridge-session', sessionId: id, bridgeSessionId: 'cse_x', lastSequenceNum: 2 })}\n`;
+    await writeFile(transcript, live);
+    const result = await run(TARGET, tombstoneScript(transcript));
+    assert.equal(result.code, 0, result.stderr);
+    assert.ok(result.stdout.includes(`CCAS_TOMBSTONE:${id}`) && result.stdout.includes('CCAS_OK'), result.stdout);
+    assert.equal(await readFile(transcript, 'utf8'), `${live}${bridgeTombstone(id)}\n`);
+  });
+
+  it('sets created paths aside and moves kept ones back on paths with spaces and quotes', async () => {
+    const created = path.join(dir, "new 'one'.jsonl");
+    await writeFile(created, 'created by the operation');
+    // A temporary file a cut-short copy left next to it goes aside too.
+    await writeFile(`${created}.ccas-tmp.4242`, 'half');
+    const original = path.join(dir, "old 'one'");
+    const kept = `${original}.ccas-backup-J1`;
+    await writeFile(kept, 'the original');
+    const result = await run(TARGET, undoScript({ created: [created], moved: [{ from: original, to: kept }], tag: 'R1' }));
+    assert.equal(result.code, 0, result.stderr);
+    assert.ok(result.stdout.includes('CCAS_OK') && !result.stdout.includes('CCAS_WARN'), result.stdout);
+    assert.equal(await readFile(`${created}.ccas-removed-R1`, 'utf8'), 'created by the operation');
+    assert.equal(await readFile(`${created}.ccas-tmp.4242.ccas-removed-R1`, 'utf8'), 'half');
+    assert.equal(await pathExists(created), false);
+    assert.equal(await readFile(original, 'utf8'), 'the original');
+    assert.equal(await pathExists(kept), false);
   });
 });
