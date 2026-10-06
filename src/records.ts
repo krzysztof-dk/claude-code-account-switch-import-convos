@@ -11,6 +11,28 @@
 // example). The app itself is less forgiving: it writes records from a list
 // of fields it knows, so a field only this tool knows (the ccas stamp) is
 // gone the first time the app saves the record again.
+//
+// The field lists below were first read from the record serializer of
+// Claude.app 2.9939.2 (September 2026) and checked again against 2.19675.0
+// on 2026-10-05: its serializer and deserializer in app.asar, the function
+// that builds a fork's record, and "uD", which promotes local_*.json.tmp
+// files to records. What that check found and this module relies on:
+//   - the serializer writes about 120 fields. The ones that name the source
+//     account or things that live under it are in SOURCE_BOUND_FIELDS, the
+//     Remote Control ones in REMOTE_CONTROL_FIELDS, the ones a copy may
+//     carry in KNOWN_RECORD_FIELDS; unknownFields() names everything else,
+//     so a newer app shows its new fields in this tool's output instead of
+//     leaking them into copies unnoticed (records.test.ts keeps every field
+//     of the 2.19675.0 serializer in exactly one list)
+//   - at load time the app derives remoteControlUserToggled from
+//     remoteControlUserEnabled === false, remoteControlUserRequested from
+//     remoteControlUserEnabled (or a pending first start that asked for
+//     Remote Control) and sshRemoteProjectDir from sshRemoteTranscriptPath;
+//     withRemoteControlOff and SOURCE_BOUND_FIELDS agree with that
+//   - a file named local_<uuid>.json.tmp younger than 30 days is promoted to
+//     a record when the record is missing or unparsable, so the temporary
+//     names this tool writes through (fsx.ts, tempPathFor) must never end in
+//     ".json.tmp"
 import { randomUUID } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -199,6 +221,49 @@ export const SOURCE_BOUND_FIELDS = [
   'interruptedUnseenResume',
   'armedWorkAtQuit',
   'pendingFirstStart',
+  // Added 2026-10-05 after checking the serializer of Claude.app 2.19675.0
+  // (the lists above came from 2.9939.2, and copies carried the new fields
+  // verbatim). The account the record belongs to, by e-mail: a copy lives
+  // under another account, and the app would show and use the wrong address.
+  'emailAddress',
+  // Artifacts published on claude.ai under the source account and tasks the
+  // source spawned in the cloud; both belong to that account's claude.ai.
+  'publishedArtifacts',
+  'cloudSpawnedTasks',
+  // Messages exchanged with other sessions of the source account (peers) and
+  // the session that dispatched this one; the copy's account has none of them.
+  'peerInbound',
+  'peerReceipts',
+  'dispatchParentId',
+  'dispatchParentOrigin',
+  // The app's own fork lineage: the record this one was forked from and the
+  // message it was forked at, both of the source account.
+  'forkedFromSessionId',
+  'forkedAtMessageUuid',
+  'lineageDetached',
+  // The app's own importer and index: where it imported the record from,
+  // when it indexed it, whether a resume was confirmed, and a staged
+  // transcript it still has to move into place. All of it is the source's
+  // history with the app; stagedTranscriptPath in particular makes the app
+  // read the transcript from that path instead of the projects directory.
+  'importedFrom',
+  'indexedAt',
+  'resumeConfirmed',
+  'stagedTranscriptPath',
+  // Cloud environments and Cowork spaces are resources of the organization
+  // the source ran under.
+  'envScopeId',
+  'startedFromEnvironmentId',
+  'spaceId',
+  // A scheduled task of the source account started or continued this
+  // conversation; scheduled tasks are not transferred (operations.ts warns).
+  'scheduledTaskId',
+  'scheduledRunContinued',
+  // The source was moved to Anthropic's cloud under its account, or the app
+  // could not read the source's transcript; the copy has its own, complete
+  // transcript on this machine (or its SSH host).
+  'movedToCloud',
+  'transcriptUnavailable',
 ] as const;
 
 /** A shallow copy of a record without SOURCE_BOUND_FIELDS; the input is left as it is. */
@@ -283,6 +348,184 @@ function remoteControlState(record: SessionRecord): string {
 export function inheritsRemoteControl(copy: SessionRecord, source: SessionRecord | null | undefined): boolean {
   const base: SessionRecord = source ? withoutSourceBoundFields(source) : { sessionId: '', createdAt: 0, lastActivityAt: 0 };
   return remoteControlState(copy) === remoteControlState(base);
+}
+
+/**
+ * Fields a copy may carry as they are, read from the serializer of
+ * Claude.app 2.19675.0 on 2026-10-05 (plus two seen in records on disk that
+ * day, promptSuggestion and planPath): they describe the conversation (its
+ * folder and worktree, title, archive state, model, permission mode, rewind
+ * points, the branches it wrote, side-session bookkeeping) or this machine,
+ * which both accounts share. Together with SOURCE_BOUND_FIELDS and
+ * REMOTE_CONTROL_FIELDS this covers every field that serializer writes
+ * (records.test.ts holds the serializer's list and fails on a field that is
+ * in none of the three), and unknownFields() reports fields outside all
+ * three, so a newer app version shows its new fields in the tool's output
+ * for the next review to classify instead of copies carrying them
+ * unnoticed. The fields this tool itself requires or writes (sessionId,
+ * createdAt, lastActivityAt, cliSessionId, the Remote Control switch, the
+ * ccas stamp) are listed here too.
+ */
+export const KNOWN_RECORD_FIELDS = [
+  // Required by the app (parseRecord) and this tool.
+  'sessionId',
+  'createdAt',
+  'lastActivityAt',
+  'cliSessionId',
+  // Where the conversation runs: its folder, worktree and git anchors on
+  // this machine, the branches and pull requests it worked on.
+  'cwd',
+  'originCwd',
+  'worktreePath',
+  'worktreeName',
+  'worktreeLazy',
+  'worktreePinned',
+  'keptDirtyWorktree',
+  'keptDirtyAt',
+  'keptWorktreeLeftover',
+  'gitAnchors',
+  'gitAnchorsLookupOnly',
+  'gitAnchorsFolderRealpath',
+  'sourceBranch',
+  'branch',
+  'writtenBranches',
+  'prs',
+  'seenCommentIds',
+  'titleFromPr',
+  'autoArchiveOnPrClose',
+  // How it is shown: title, archive and star state, colour, when it was focused.
+  'title',
+  'titleSource',
+  'previousTitles',
+  'titleTurn',
+  'titleCheck',
+  'titleOffers',
+  'titleSuggestionsOff',
+  'isArchived',
+  'isStarred',
+  'autoArchiveExempt',
+  'color',
+  'lastFocusedAt',
+  // How the CLI is started for it: model, effort, agent, permissions, MCP
+  // servers, the binary and the tool surface it was last started with.
+  'model',
+  'effort',
+  'effortInherited',
+  'agent',
+  'permissionMode',
+  'sessionSettings',
+  'enabledMcpTools',
+  'remoteMcpServersConfig',
+  'withheldConnectorHosts',
+  'sessionPermissionUpdates',
+  'alwaysAllowedReasons',
+  'bypassChosenInApp',
+  'autoChosenInApp',
+  'lastSpawnRootDetected',
+  'ranInSandboxVm',
+  'tccFolderKind',
+  '_startedThroughHostCliLauncher',
+  'launcherAtSpawn',
+  'cliBinaryPin',
+  'cliMcpAppServerNames',
+  'spawnSeed',
+  'promptAppendSnapshot',
+  'toolSurfaceSnapshot',
+  'terminalClaudeTabOrdinal',
+  // The machine it runs on (the same SSH host after a copy: sshConfig is
+  // kept on purpose) and the browser and computer-use grants given to it.
+  'sshConfig',
+  'wslConfig',
+  'chromePermissionMode',
+  'chromeAllowedDomains',
+  'chromeTabGroupId',
+  'cuAllowedApps',
+  'cuGrantFlags',
+  'cuFlagsGrantedAt',
+  'cuLastScreenshotDims',
+  'cuSelectedDisplayId',
+  // Positions in the transcript and what the app remembers about its turns.
+  // Copies keep every message uuid (transcripts.ts), so these stay valid.
+  'rewindEdges',
+  'transcriptModelStates',
+  'transcriptCuts',
+  'lastAssistantUuid',
+  'completedTurns',
+  'contextExceededCount',
+  'subagentsTruncatedFor',
+  'recap',
+  'recapAt',
+  'postTurnSummary',
+  'postTurnSummaryFor',
+  'turnWrapUp',
+  'lastTurnReport',
+  'pendingSystemReminder',
+  'promptSuggestion',
+  'planPath',
+  'error',
+  'errorCategory',
+  'errorAt',
+  'priorErrorMark',
+  'queryCrashes',
+  // Sessions this one started (side sessions) and the one it was started
+  // from: the app tolerates ids it cannot find, and spawnedFrom is kept so
+  // a copy still says where it came from.
+  'spawnedFrom',
+  'spawnedFromEndNotified',
+  'sideSessionNotes',
+  'queuedSideSessionNotes',
+  'sideSessionReportOwed',
+  'sideSessionStartsSinceUserMessage',
+  'sideSessionOffersMuted',
+  'backgroundTaskSuggestions',
+  'resolvedBackgroundTaskSuggestions',
+  'latestUserFrameAt',
+  // Interface state: scratch files, offered prompts, cards and panels shown.
+  'scratchPromptRecents',
+  'scratchOfferFolder',
+  'scratchFilesLeftIn',
+  'scratchCarried',
+  'classifierSummaryEnabled',
+  'reportFindingsCard',
+  'turnBoxDeclared',
+  'turnBoxMounted',
+  'setupTools',
+  'midTaskReplyTool',
+  'conversationPluginLoaded',
+  'asides',
+  'violinBowPrompts',
+  'violinBowPromptKinds',
+  'violinBow',
+  'violinBowHomeSettings',
+  'lanyardOfferPrompt',
+  'autoModeServerFallbackPrompt',
+  'devIntents',
+  'devIntentTriggers',
+  'autoFixDelivered',
+  'autoFixNoticeSent',
+  // A session adopted from another surface keeps saying so (synthesized
+  // records set it, see operations.ts).
+  'adoptedFromOtherSurface',
+  'surfaceNoticeUuid',
+  // The person's own Remote Control switch, which withRemoteControlOff sets.
+  'remoteControlUserEnabled',
+  'remoteControlUserToggled',
+  // This tool's own stamp (CcasStamp).
+  'ccas',
+] as const;
+
+/**
+ * Field names of a record that none of the three lists classifies: what a
+ * newer app version added since 2.19675.0. The inventory reports them per
+ * account (inventory.ts) so the next review sorts them into
+ * SOURCE_BOUND_FIELDS or KNOWN_RECORD_FIELDS; until then a copy carries them
+ * verbatim, as it does every field it does not know.
+ */
+export function unknownFields(record: SessionRecord): string[] {
+  const known = new Set<string>([...SOURCE_BOUND_FIELDS, ...REMOTE_CONTROL_FIELDS, ...KNOWN_RECORD_FIELDS]);
+  return Object.keys(record)
+    .filter((field) => !known.has(field))
+    .sort();
 }
 
 export async function readRecords(accountDir: string): Promise<{ records: LoadedRecord[]; problems: string[] }> {

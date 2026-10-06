@@ -69,6 +69,12 @@ export interface TranscriptSpec {
   model?: string;
   /** Text of the first prompt; defaults to "prompt 1". */
   firstPrompt?: string;
+  /**
+   * Whether the session also gets the directories the CLI keeps per session
+   * outside projects/ (file-history, uploads; see sessionKeyedFixtureFiles).
+   * On unless switched off, since real sessions that edited files have them.
+   */
+  sessionDirs?: boolean;
 }
 
 export interface BuiltTranscript {
@@ -170,6 +176,32 @@ export interface WrittenTranscript extends BuiltTranscript {
   cwd: string;
 }
 
+/**
+ * Files of the directories the CLI keeps per session outside projects/, keyed
+ * by the session id (SESSION_KEYED_DIRS in src/transcripts.ts): the pre-edit
+ * snapshots /rewind restores from (file-history/<id>/<hash>@v<N>) and an
+ * attachment a Remote Control session refers to by path (uploads/<id>/). The
+ * files never carry the session id in their names or contents, only the
+ * directory does, which is what the copy relies on. Paths are relative to the
+ * CLI directory (~/.claude on a real machine, the world's claude dir here).
+ */
+export function sessionKeyedFixtureFiles(cliId: string): { rel: string; bytes: Buffer }[] {
+  return [
+    { rel: path.join('file-history', cliId, '6d282dbb5ee2b832@v1'), bytes: Buffer.from('const edited = "before";\n') },
+    { rel: path.join('file-history', cliId, '6d282dbb5ee2b832@v2'), bytes: Buffer.from('const edited = "after";\n') },
+    { rel: path.join('uploads', cliId, 'attachment.png'), bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0xfe]) },
+  ];
+}
+
+/** Writes sessionKeyedFixtureFiles under a CLI directory (the world's, or the fake host's ~/.claude). */
+export async function writeSessionKeyedDirs(claudeDir: string, cliId: string): Promise<void> {
+  for (const file of sessionKeyedFixtureFiles(cliId)) {
+    const target = path.join(claudeDir, file.rel);
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, file.bytes);
+  }
+}
+
 /** Writes a transcript plus a sidecar directory with a tool result, a sub-agent transcript and a custom title. */
 export async function writeTranscript(world: World, spec: TranscriptSpec = {}): Promise<WrittenTranscript> {
   const built = buildTranscriptLines(spec);
@@ -187,6 +219,7 @@ export async function writeTranscript(world: World, spec: TranscriptSpec = {}): 
     `${JSON.stringify({ type: 'user', sessionId: built.cliId, isSidechain: true, uuid: randomUUID(), message: { role: 'user', content: 'sub task' } })}\n`,
   );
   if (spec.title) await writeFile(path.join(sidecarDir, 'custom-title.json'), JSON.stringify({ customTitle: spec.title }));
+  if (spec.sessionDirs !== false) await writeSessionKeyedDirs(world.paths.claudeDir, built.cliId);
   // The file gets the modification time of its last line, as a real transcript
   // of a finished session has; the tool falls back to it for the last activity
   // of a transcript without timestamps.
@@ -318,6 +351,9 @@ export async function writeHostTranscript(world: World, ssh: WrittenSshTranscrip
   for (const agentPath of ssh.agentPaths) await copyFile(agentPath, path.join(sidecarDir, 'subagents', path.basename(agentPath)));
   await writeFile(path.join(sidecarDir, 'tool-results', 'toolu_1.txt'), `saved output of ${ssh.cliId}\n`);
   await writeFile(path.join(sidecarDir, 'custom-title.json'), JSON.stringify({ customTitle: `title of ${ssh.cliId}` }));
+  // The CLI on the host keeps the per-session directories there (it is the
+  // process that edits files and receives attachments), never on the Mac.
+  await writeSessionKeyedDirs(path.join(hostHome(world), '.claude'), ssh.cliId);
   return { path: filePath, sidecarDir };
 }
 

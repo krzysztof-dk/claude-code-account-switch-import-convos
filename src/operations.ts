@@ -100,7 +100,16 @@ import {
   type HostRunner,
   type HostTarget,
 } from './ssh-host.ts';
-import { appendBridgeTombstones, copyRewritingSessionId, copySidecar, isSshMirror, liveBridges, sshMirrorDir } from './transcripts.ts';
+import {
+  appendBridgeTombstones,
+  copyRewritingSessionId,
+  copySessionKeyedDir,
+  copySidecar,
+  isSshMirror,
+  liveBridges,
+  sessionKeyedDirs,
+  sshMirrorDir,
+} from './transcripts.ts';
 
 export type TransferMode = 'copy' | 'move';
 export type ConflictPolicy = 'skip' | 'overwrite';
@@ -316,13 +325,36 @@ async function failed(log: OperationLog, item: TransferItem, error: unknown): Pr
 }
 
 /**
+ * Gives a copy the directories the CLI keeps per session outside projects/
+ * (transcripts.ts, SESSION_KEYED_DIRS) under the copy's id, each announced
+ * in the journal before it is written, so a restore takes it away again. A
+ * conversation that runs on an SSH host has them on the host, not here, so
+ * nothing is found for it and ssh-host.ts does the same there.
+ */
+async function copySessionKeyedDirs(context: OperationContext, log: OperationLog, fromCli: string | null, toCli: string): Promise<void> {
+  if (!fromCli || !isUuid(fromCli)) return;
+  for (const dir of await sessionKeyedDirs(context.paths.claudeDir, fromCli)) {
+    const destination = path.join(context.paths.claudeDir, dir.name, toCli);
+    await log.created(destination);
+    await copySessionKeyedDir(dir.path, destination);
+  }
+}
+
+/** Moves the per-session directories of a CLI session id into the backup mirror: an update replaces them, a move takes them away with the transcript. */
+async function moveAwaySessionKeyedDirs(context: OperationContext, log: OperationLog, cli: string | null): Promise<void> {
+  if (!cli || !isUuid(cli)) return;
+  for (const dir of await sessionKeyedDirs(context.paths.claudeDir, cli)) await log.moveAway(dir.path);
+}
+
+/**
  * Moves the source record and its transcript files into the backup mirror
- * (the "remove" half of a move). For an SSH session the whole mirror goes,
- * but only a directory that really is this session's mirror (ssh-<its id>).
- * The transcript on the SSH host stays: the host is not this tool's to clean
+ * (the "remove" half of a move), the per-session directories of its CLI
+ * session included. For an SSH session the whole mirror goes, but only a
+ * directory that really is this session's mirror (ssh-<its id>). The
+ * transcript on the SSH host stays: the host is not this tool's to clean
  * up, and a transcript no record points at does no harm there.
  */
-async function removeSourceFiles(log: OperationLog, source: Conversation, target: Conversation | null): Promise<void> {
+async function removeSourceFiles(context: OperationContext, log: OperationLog, source: Conversation, target: Conversation | null): Promise<void> {
   if (source.record) await log.moveAway(source.record.path);
   const transcript = source.transcript;
   if (!transcript) return;
@@ -338,6 +370,7 @@ async function removeSourceFiles(log: OperationLog, source: Conversation, target
   }
   await log.moveAway(transcript.path);
   if (transcript.sidecarDir) await log.moveAway(transcript.sidecarDir);
+  await moveAwaySessionKeyedDirs(context, log, transcript.cliSessionId);
 }
 
 /** The CLI session id of a conversation's transcript (the record's, else the transcript's own). */
@@ -358,10 +391,10 @@ function isSshWithoutMirror(source: Conversation): boolean {
   return sshHostOf(source) !== null && source.transcript === null;
 }
 
-/** What the host holds for a copy, and where its transcript goes (see planHostCopy). */
+/** What the host holds for a copy, and where its transcript and per-session directories go (see planHostCopy). */
 interface HostCopyPlan {
   target: HostTarget;
-  probe: HostProbe & { dir: string };
+  probe: HostProbe & { dir: string; claudeDir: string };
   sourceCliSessionId: string;
   targetCliSessionId: string;
 }
@@ -406,21 +439,43 @@ async function planHostCopy(
       `the copy's transcript on ${host} is ${probe.target}, not next to the original in ${probe.dir}; move it there or set it aside by hand`,
     );
   }
-  return { target, probe: { ...probe, dir: probe.dir }, sourceCliSessionId, targetCliSessionId };
+  // The per-session directories (file-history, uploads, image-cache) live
+  // under the host's CLI directory, which the probe reports; without it they
+  // could not be placed, and a fresh copy must not find any under its id.
+  const claudeDir = probe.claudeDir;
+  if (claudeDir === null) {
+    throw new HostStepError(target, 'failed', `${host} did not report its Claude directory, so the copy's per-session directories could not be placed there`);
+  }
+  if (mode === 'create' && probe.targetDirs.length > 0) {
+    const taken = probe.targetDirs.map((name) => path.posix.join(claudeDir, name, targetCliSessionId));
+    throw new HostStepError(target, 'conflict', `${taken.join(', ')} exists on ${host} already`);
+  }
+  return { target, probe: { ...probe, dir: probe.dir, claudeDir }, sourceCliSessionId, targetCliSessionId };
 }
 
 /**
  * Makes the copy on the host (ssh-host.ts, copyOnHost), journaling every path
  * before the remote script runs: what an update replaces is kept aside under
- * the journal id, then the new side folder and transcript are announced.
+ * the journal id, then the new per-session directories, side folder and
+ * transcript are announced, in the order the script moves them into place.
  */
 async function applyHostCopy(context: OperationContext, log: OperationLog, plan: HostCopyPlan, replaceTag: string | null): Promise<void> {
-  const request = { dir: plan.probe.dir, sourceCliSessionId: plan.sourceCliSessionId, targetCliSessionId: plan.targetCliSessionId, replaceTag };
+  const request = {
+    dir: plan.probe.dir,
+    claudeDir: plan.probe.claudeDir,
+    sourceCliSessionId: plan.sourceCliSessionId,
+    targetCliSessionId: plan.targetCliSessionId,
+    dirs: plan.probe.sourceDirs,
+    existingDirs: plan.probe.targetDirs,
+    replaceTag,
+  };
   const paths = hostCopyPaths(request, plan.probe.sourceSidecar);
   if (paths.backupSuffix) {
     if (plan.probe.target) await log.remoteMoved(plan.target, plan.probe.target, `${plan.probe.target}${paths.backupSuffix}`);
     if (plan.probe.targetSidecar) await log.remoteMoved(plan.target, plan.probe.targetSidecar, `${plan.probe.targetSidecar}${paths.backupSuffix}`);
+    for (const existing of paths.existingDirs) await log.remoteMoved(plan.target, existing, `${existing}${paths.backupSuffix}`);
   }
+  for (const dir of paths.dirs) await log.remoteCreated(plan.target, dir);
   if (paths.sidecar) await log.remoteCreated(plan.target, paths.sidecar);
   await log.remoteCreated(plan.target, paths.transcript);
   await copyOnHost(hostRunnerOf(context), plan.target, request);
@@ -514,6 +569,7 @@ async function createCopy(context: OperationContext, item: TransferItem, warning
         await copySidecar(transcript.sidecarDir, sidecarPath, transcript.cliSessionId, newCliSessionId);
       }
     }
+    await copySessionKeyedDirs(context, log, cliSessionIdOf(source), newCliSessionId);
     if (hostPlan) await applyHostCopy(context, log, hostPlan, null);
     await assertStillAllowed(context);
     // The link goes to disk before the record: a run cut short in between
@@ -610,6 +666,7 @@ async function updateExisting(context: OperationContext, item: TransferItem, war
       // writing fresh ones makes restore a plain move back.
       await log.moveAway(transcriptPath);
       await log.moveAway(sidecarPath);
+      await moveAwaySessionKeyedDirs(context, log, targetCli);
       await log.created(transcriptPath);
       await copyRewritingSessionId(transcript.path, transcriptPath, transcript.cliSessionId, targetCli);
       await appendBridgeTombstones(transcriptPath);
@@ -617,6 +674,7 @@ async function updateExisting(context: OperationContext, item: TransferItem, war
         await log.created(sidecarPath);
         await copySidecar(transcript.sidecarDir, sidecarPath, transcript.cliSessionId, targetCli);
       }
+      await copySessionKeyedDirs(context, log, transcript.cliSessionId, targetCli);
     }
     if (hostPlan) await applyHostCopy(context, log, hostPlan, log.entry.id);
     await assertStillAllowed(context);
@@ -631,7 +689,7 @@ async function updateExisting(context: OperationContext, item: TransferItem, war
       target: targetEndpoint,
     });
     await writeRecord(existing.record.path, record);
-    if (mode === 'move') await removeSourceFiles(log, source, existing);
+    if (mode === 'move') await removeSourceFiles(context, log, source, existing);
     await log.finish(finalAction);
     return outcomeOf(item, finalAction, null, log.entry.warnings, false, { host, journalId: log.entry.id });
   } catch (error) {
@@ -683,7 +741,8 @@ async function moveRecord(context: OperationContext, item: TransferItem, warning
   const gate = await openGate(context, item, warnings);
   if (isOutcome(gate)) return gate;
 
-  const log = openLog(context, nowOf(context), {
+  const now = nowOf(context);
+  const log = openLog(context, now, {
     mode: 'move',
     action: 'moved',
     title: source.title,
@@ -715,7 +774,27 @@ async function moveRecord(context: OperationContext, item: TransferItem, warning
     }
     await log.move(source.record.path, destination);
     await assertStillAllowed(context);
-    await writeRecord(destination, { ...withRemoteControlOff(source.record.record), ccas: stampFor(source, nowOf(context)) });
+    // Found by the review of 2026-10-05: a move kept the record's ids and so
+    // wrote no lineage link, leaving the stamp below as the only copy point,
+    // and the app drops the stamp the first time it saves the record. From
+    // then on the cutoff in voteEmail (inventory.ts) was zero and the source
+    // account's session_context lines voted for the target account, which
+    // could relabel the target account with the source's e-mail in this
+    // tool's own lists (reproduced on fixtures before the fix). The link is
+    // the lasting copy point, as for copies; pairing never needs it, since
+    // the record id already pairs a moved record, and the source side of the
+    // link names a record that no longer exists.
+    await context.lineage.add({
+      rootUuid: source.summary?.rootUuid ?? source.key,
+      at: now,
+      journalId: log.entry.id,
+      mode: 'move',
+      action: 'moved',
+      sourceLineCount: source.summary?.lineCount ?? 0,
+      source: endpointOf(source),
+      target: { accountId: target.accountId, orgId: target.orgId, sessionId: source.record.record.sessionId, cliSessionId: endpointOf(source).cliSessionId },
+    });
+    await writeRecord(destination, { ...withRemoteControlOff(source.record.record), ccas: stampFor(source, now) });
     await log.finish('moved');
     return outcomeOf(item, 'moved', null, log.entry.warnings, false, { host, journalId: log.entry.id });
   } catch (error) {
@@ -769,12 +848,31 @@ async function planRepair(context: OperationContext, item: TransferItem, warning
     });
     if (probe.target !== null) {
       if (probe.targetLive.some((bridge) => inherited.has(bridge))) host = { kind: 'tombstones', target, path: probe.target };
-    } else if (probe.dir !== null && sourceCli !== null && isUuid(sourceCli) && probe.targetSidecar === null) {
-      host = { kind: 'copy', plan: { target, probe: { ...probe, dir: probe.dir }, sourceCliSessionId: sourceCli, targetCliSessionId: targetCli } };
+    } else if (
+      probe.dir !== null &&
+      probe.claudeDir !== null &&
+      sourceCli !== null &&
+      isUuid(sourceCli) &&
+      probe.targetSidecar === null &&
+      probe.targetDirs.length === 0
+    ) {
+      host = {
+        kind: 'copy',
+        plan: { target, probe: { ...probe, dir: probe.dir, claudeDir: probe.claudeDir }, sourceCliSessionId: sourceCli, targetCliSessionId: targetCli },
+      };
     } else if (probe.dir === null) {
       warnings.push(`neither the original's nor the copy's transcript is on ${describeHost(target)}, so the copy cannot be resumed there`);
+    } else if (probe.claudeDir === null) {
+      warnings.push(`${describeHost(target)} did not report its Claude directory, so the copy cannot get its transcript there`);
     } else {
-      warnings.push(`${probe.targetSidecar} exists on ${describeHost(target)} without a transcript next to it; set it aside by hand, then transfer again`);
+      // Leftovers of the copy without a transcript next to them (a side
+      // folder or per-session directories): never merged into, only reported.
+      const leftovers = [...(probe.targetSidecar ? [probe.targetSidecar] : []), ...probe.targetDirs.map((name) => path.posix.join(probe.claudeDir ?? '', name, targetCli))];
+      warnings.push(
+        leftovers.length > 0
+          ? `${leftovers.join(', ')} exists on ${describeHost(target)} without a transcript next to it; set it aside by hand, then transfer again`
+          : `the copy cannot get its transcript on ${describeHost(target)}: the original's transcript id is unknown`,
+      );
     }
   }
   return { existing, record, localTombstones, host };
@@ -868,7 +966,8 @@ async function removeSource(context: OperationContext, item: TransferItem, warni
   if (context.dryRun) return outcomeOf(item, 'moved', fullReason, warnings, true);
   const gate = await openGate(context, item, warnings);
   if (isOutcome(gate)) return gate;
-  const log = openLog(context, nowOf(context), {
+  const now = nowOf(context);
+  const log = openLog(context, now, {
     mode: 'move',
     action: 'moved',
     title: source.title,
@@ -881,7 +980,22 @@ async function removeSource(context: OperationContext, item: TransferItem, warni
   await log.start();
   try {
     if (plan && repair) await applyRepair(context, log, plan);
-    await removeSourceFiles(log, source, item.assessment.existing);
+    // Every move leaves a link (see moveRecord); here the copy that stays
+    // already has one from when it was made, and this one records that the
+    // source side went away in a move, with the copy point of that moment.
+    if (item.assessment.existing) {
+      await context.lineage.add({
+        rootUuid: source.summary?.rootUuid ?? source.key,
+        at: now,
+        journalId: log.entry.id,
+        mode: 'move',
+        action: 'moved',
+        sourceLineCount: source.summary?.lineCount ?? 0,
+        source: endpointOf(source),
+        target: endpointOf(item.assessment.existing),
+      });
+    }
+    await removeSourceFiles(context, log, source, item.assessment.existing);
     await log.finish('moved');
     return outcomeOf(item, 'moved', fullReason, log.entry.warnings, false, { journalId: log.entry.id });
   } catch (error) {

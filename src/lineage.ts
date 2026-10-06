@@ -13,6 +13,16 @@
 // A link whose target never came to be (an operation cut short after the link
 // was written but before the record) names a record that does not exist, and
 // pairing ignores it.
+//
+// Moves write links too (since 2026-10-05): the record keeps its id, so both
+// ends name the same record id under different accounts. Pairing does not
+// need such a link (the record id already pairs a moved record with whatever
+// still refers to it), but the e-mail votes do: a moved transcript carries
+// the source account's session_context lines, and the link's sourceLineCount
+// is the lasting copy point past which sightings count for the new account
+// (inventory.ts, voteEmail). Before that, a move relied on the ccas stamp
+// alone, and once the app had saved the record and dropped the stamp, the
+// source account's e-mail voted for the target account.
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { writeFileAtomic } from './fsx.ts';
@@ -31,8 +41,12 @@ export interface LineageLink {
   at: number;
   journalId: string;
   mode: 'copy' | 'move' | 'import';
-  /** created: a fresh copy; updated: an older copy brought up to date. */
-  action: 'created' | 'updated';
+  /**
+   * created: a fresh copy; updated: an older copy brought up to date; moved:
+   * the record changed accounts with its ids (the link only marks the copy
+   * point for the e-mail votes, see the header).
+   */
+  action: 'created' | 'updated' | 'moved';
   /** Non-blank line count of the source transcript at that moment (see CcasStamp). */
   sourceLineCount: number;
   source: LineageEndpoint;

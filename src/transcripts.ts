@@ -43,13 +43,13 @@
 // conversation on another account is the copy of which is decided by links
 // the tool records when it copies (inventory.ts, lineage.ts), never by content.
 import { createReadStream, createWriteStream } from 'node:fs';
-import { appendFile, copyFile, mkdir, open, readdir, rename, rm, stat } from 'node:fs/promises';
+import { appendFile, copyFile, cp, mkdir, open, readdir, rename, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { StringDecoder } from 'node:string_decoder';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { tempPathFor } from './fsx.ts';
+import { isDirectory, tempPathFor } from './fsx.ts';
 import { isUuid } from './records.ts';
 
 export interface TranscriptLocation {
@@ -79,6 +79,56 @@ export function sshMirrorDir(projectsRoot: string, cliSessionId: string): string
  */
 export function isSshMirror(location: Pick<TranscriptLocation, 'projectDir' | 'cliSessionId'>): boolean {
   return path.basename(location.projectDir) === `${SSH_MIRROR_PREFIX}${location.cliSessionId}`;
+}
+
+/**
+ * Directories the CLI keeps per session outside projects/, one subdirectory
+ * per session id in each (documented on code.claude.com under "Claude
+ * directory" and "Checkpointing", checked 2026-10-05):
+ *   file-history/<id>/   pre-edit snapshots of the files the session changed,
+ *                        named <hash>@v<N>, which /rewind restores from.
+ *                        Without them a rewind in the copy ends with "No
+ *                        files were restored"; the app's own fork copies them
+ *                        (Claude Code changelog v2.1.275)
+ *   uploads/<id>/        attachments a Remote Control session refers to by
+ *                        path from the transcript; the transcript of a copy
+ *                        has those paths rewritten to the new id, so they
+ *                        lead nowhere unless the directory comes along
+ *   image-cache/<id>/    images cached for the conversation
+ * The files inside never carry the session id in their names or contents,
+ * only the directory does, so a copy is a plain copy under the new id, no
+ * rewriting (unlike the transcript and its side folder). Left behind on
+ * purpose: session-env/<id> and tasks/<id> (state of a CLI process, not of
+ * the conversation), debug/<id>.txt, dev-mods/<id> and the scratchpad under
+ * /private/tmp; the CLI sweeps all of these with the transcript after
+ * cleanupPeriodDays anyway. A conversation that runs on an SSH host has
+ * these directories on the host, where its CLI runs; ssh-host.ts copies
+ * them there, and nothing is found for it here.
+ */
+export const SESSION_KEYED_DIRS = ['file-history', 'uploads', 'image-cache'] as const;
+
+export type SessionKeyedDirName = (typeof SESSION_KEYED_DIRS)[number];
+
+/** The directories of SESSION_KEYED_DIRS a session has under a CLI directory, by name, with their absolute paths. */
+export async function sessionKeyedDirs(claudeDir: string, cliSessionId: string): Promise<{ name: SessionKeyedDirName; path: string }[]> {
+  const found: { name: SessionKeyedDirName; path: string }[] = [];
+  for (const name of SESSION_KEYED_DIRS) {
+    const dir = path.join(claudeDir, name, cliSessionId);
+    if (await isDirectory(dir)) found.push({ name, path: dir });
+  }
+  return found;
+}
+
+/**
+ * Copies one session-keyed directory as it is (every file and its
+ * permission bits) under another session id. The destination must not
+ * exist: an update moves the old directory into the backup first
+ * (operations.ts), and a copy whose destination is taken is a mistake
+ * worth an error, never a silent merge of two sessions' files.
+ */
+export async function copySessionKeyedDir(source: string, destination: string): Promise<void> {
+  await mkdir(path.dirname(destination), { recursive: true });
+  await cp(source, destination, { recursive: true, errorOnExist: true, force: false });
 }
 
 export interface BridgeInfo {

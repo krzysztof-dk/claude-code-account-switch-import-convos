@@ -120,6 +120,41 @@ describe('records', () => {
     }
   });
 
+  it('drops the identity and lineage fields the app 2.19675.0 serializer writes', () => {
+    // Read from the record serializer of Claude.app 2.19675.0 (2026-10-05):
+    // these name the source account (its e-mail), things that live under it
+    // on claude.ai (published artifacts, cloud tasks, environments, spaces),
+    // sessions it talked to (peers, the dispatch parent) and records it was
+    // forked or imported from. None of it describes the copy.
+    const identity = {
+      emailAddress: 'alpha@example.com',
+      publishedArtifacts: [{ id: 'art_1' }],
+      peerInbound: [{ uuid: 'p1', from: 'local_other' }],
+      peerReceipts: [{ uuid: 'p1' }],
+      dispatchParentId: 'local_parent',
+      dispatchParentOrigin: 'code',
+      forkedFromSessionId: 'local_parent',
+      forkedAtMessageUuid: '5c1e7a2b-0d4f-4e8a-9b3c-6f2d8e1a7b40',
+      lineageDetached: true,
+      stagedTranscriptPath: '/tmp/staging/.import-1.tmp',
+      envScopeId: 'env_1',
+      startedFromEnvironmentId: 'env_1',
+      spaceId: 'space_1',
+      scheduledTaskId: 'task_1',
+      scheduledRunContinued: true,
+      cloudSpawnedTasks: [{ id: 'cloud_1' }],
+      importedFrom: { kind: 'previous-profile' },
+      indexedAt: 3,
+      resumeConfirmed: true,
+    };
+    const record = parseRecord(JSON.stringify({ sessionId: 'local_a', createdAt: 1, lastActivityAt: 2, title: 'kept', effort: 'high', ...identity }));
+    assert.ok(record);
+    const stripped = withoutSourceBoundFields(record);
+    for (const field of Object.keys(identity)) assert.ok(!(field in stripped), `${field} must not reach the copy`);
+    assert.equal(stripped.title, 'kept');
+    assert.equal(stripped['effort'], 'high');
+  });
+
   it('switches Remote Control off the way the app records a conversation started without it', () => {
     const rc = Object.fromEntries(REMOTE_CONTROL_FIELDS.map((field) => [field, `value of ${field}`]));
     const record: SessionRecord = { sessionId: 'local_a', createdAt: 1, lastActivityAt: 2, title: 'kept', remoteControlUserEnabled: true, ...rc };

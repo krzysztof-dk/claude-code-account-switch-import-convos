@@ -238,10 +238,13 @@ function linkConversations(conversations: readonly Conversation[], links: readon
 
 /**
  * The e-mail a listed conversation may vote with. A copy made by this tool
- * still carries the source account's session_context lines, so only sightings
+ * (and a moved record, whose transcript is the same file as before) still
+ * carries the source account's session_context lines, so only sightings
  * past the copy point count: those were written after the target account
- * continued the copy. The copy point comes from the record stamp, or from
- * lineage when the app dropped the stamp.
+ * continued the conversation. The copy point comes from the record stamp,
+ * or from lineage when the app dropped the stamp; every copy, update and
+ * move writes a link with its sourceLineCount for exactly this purpose
+ * (lineage.ts), and the largest count wins when there are several.
  */
 function voteEmail(conversation: Conversation, lineage: LineageStore | undefined): string | null {
   const summary = conversation.summary;

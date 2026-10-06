@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { FAKE_SSH, destroyWorld, localHostRunner, makeWorld, readTree, replaceInBytes, type World } from '../test/fixtures.ts';
+import { pathExists } from './fsx.ts';
 import {
   HostStepError,
   copyOnHost,
   describeHost,
+  hostCopyPaths,
   hostTargetOf,
   probeHost,
   shQuote,
@@ -15,6 +17,7 @@ import {
   sshRunner,
   tombstoneOnHost,
   undoOnHost,
+  type HostCopyRequest,
   type HostRunner,
   type HostTarget,
 } from './ssh-host.ts';
@@ -28,6 +31,8 @@ describe('ssh host', () => {
   let run: HostRunner;
   /** A project folder with a space and a single quote in its name, to prove every path is quoted. */
   let dir: string;
+  /** A copy request for an original without per-session directories (the ids are filled in per test). */
+  let plain: Pick<HostCopyRequest, 'dir' | 'claudeDir' | 'dirs' | 'existingDirs'>;
 
   /** Writes an original on the fake host: a transcript with a live Remote Control link and a side folder. */
   const writeOriginal = async (id: string): Promise<{ transcript: string; bytes: Buffer }> => {
@@ -51,6 +56,7 @@ describe('ssh host', () => {
     dir = path.join(home, '.claude', 'projects', "-Users-build-it's a dir");
     await mkdir(dir, { recursive: true });
     run = localHostRunner(home);
+    plain = { dir, claudeDir: path.join(home, '.claude'), dirs: [], existingDirs: [] };
   });
   after(async () => {
     await destroyWorld(world);
@@ -80,7 +86,16 @@ describe('ssh host', () => {
       assert.equal(probe.sourceSidecar, true);
     }
     const missing = await probeHost(run, TARGET, { sourceCliSessionId: randomUUID(), targetCliSessionId: randomUUID() });
-    assert.deepEqual(missing, { dir: null, sourceSidecar: false, target: null, targetSidecar: null, targetLive: [] });
+    assert.deepEqual(missing, {
+      dir: null,
+      sourceSidecar: false,
+      target: null,
+      targetSidecar: null,
+      targetLive: [],
+      claudeDir: path.join(home, '.claude'),
+      sourceDirs: [],
+      targetDirs: [],
+    });
   });
 
   it('copies the original next to it with the id rewritten, ends its Remote Control link, and refuses to overwrite', async () => {
@@ -88,7 +103,7 @@ describe('ssh host', () => {
     const copy = randomUUID();
     const { bytes } = await writeOriginal(id);
     const sideBefore = await readTree(path.join(dir, id));
-    const result = await copyOnHost(run, TARGET, { dir, sourceCliSessionId: id, targetCliSessionId: copy });
+    const result = await copyOnHost(run, TARGET, { ...plain, sourceCliSessionId: id, targetCliSessionId: copy });
     assert.deepEqual(result, { created: [path.join(dir, copy), path.join(dir, `${copy}.jsonl`)], moved: [], tombstoned: [copy] });
     const copied = await readFile(path.join(dir, `${copy}.jsonl`));
     assert.ok(copied.equals(Buffer.concat([replaceInBytes(bytes, id, copy), Buffer.from(`${bridgeTombstone(copy)}\n`)])));
@@ -107,7 +122,7 @@ describe('ssh host', () => {
 
     const namesBefore = (await readdir(dir)).sort();
     await assert.rejects(
-      () => copyOnHost(run, TARGET, { dir, sourceCliSessionId: id, targetCliSessionId: copy }),
+      () => copyOnHost(run, TARGET, { ...plain, sourceCliSessionId: id, targetCliSessionId: copy }),
       (error: unknown) => error instanceof HostStepError && error.kind === 'conflict' && /exists already/.test(error.message),
     );
     assert.deepEqual((await readdir(dir)).sort(), namesBefore, 'a refused copy leaves nothing behind');
@@ -117,11 +132,11 @@ describe('ssh host', () => {
     const id = randomUUID();
     const copy = randomUUID();
     await writeOriginal(id);
-    await copyOnHost(run, TARGET, { dir, sourceCliSessionId: id, targetCliSessionId: copy });
+    await copyOnHost(run, TARGET, { ...plain, sourceCliSessionId: id, targetCliSessionId: copy });
     const transcript = path.join(dir, `${copy}.jsonl`);
     await writeFile(transcript, 'the copy as it was before the update\n');
     const oldSide = await readTree(path.join(dir, copy));
-    const result = await copyOnHost(run, TARGET, { dir, sourceCliSessionId: id, targetCliSessionId: copy, replaceTag: 'J1' });
+    const result = await copyOnHost(run, TARGET, { ...plain, sourceCliSessionId: id, targetCliSessionId: copy, replaceTag: 'J1' });
     assert.deepEqual(result.moved, [transcript, path.join(dir, copy)]);
     assert.equal(await readFile(`${transcript}.ccas-backup-J1`, 'utf8'), 'the copy as it was before the update\n');
 
@@ -137,6 +152,64 @@ describe('ssh host', () => {
     assert.equal(await readFile(transcript, 'utf8'), 'the copy as it was before the update\n');
     assert.deepEqual(await readTree(path.join(dir, copy)), oldSide);
     assert.ok((await readdir(dir)).includes(`${copy}.jsonl.ccas-removed-R1`), 'the newer copy is set aside, not deleted');
+  });
+
+  it('copies the per-session directories first, keeps old ones aside on an update, and sets them aside on undo', async () => {
+    // file-history/<id> and uploads/<id> live under the host's CLI directory,
+    // not next to the transcript; the probe reports them, the copy script
+    // puts them in place before the side folder and the transcript.
+    const id = randomUUID();
+    const copy = randomUUID();
+    await writeOriginal(id);
+    const claudeDir = path.join(home, '.claude');
+    const fileHistory = (cli: string): string => path.join(claudeDir, 'file-history', cli);
+    const uploads = (cli: string): string => path.join(claudeDir, 'uploads', cli);
+    await mkdir(fileHistory(id), { recursive: true });
+    await writeFile(path.join(fileHistory(id), 'abc@v1'), 'snapshot');
+    await mkdir(uploads(id), { recursive: true });
+    await writeFile(path.join(uploads(id), 'a.png'), Buffer.from([1, 2, 3]));
+
+    const probe = await probeHost(run, TARGET, { sourceCliSessionId: id, targetCliSessionId: copy });
+    assert.equal(probe.claudeDir, claudeDir);
+    assert.deepEqual(probe.sourceDirs, ['file-history', 'uploads']);
+    assert.deepEqual(probe.targetDirs, []);
+    const request: HostCopyRequest = { dir, claudeDir, sourceCliSessionId: id, targetCliSessionId: copy, dirs: probe.sourceDirs, existingDirs: probe.targetDirs };
+    const paths = hostCopyPaths(request, true);
+    assert.deepEqual(paths.dirs, [fileHistory(copy), uploads(copy)]);
+    assert.deepEqual(paths.existingDirs, []);
+    const result = await copyOnHost(run, TARGET, request);
+    // Announced in the order they went into place: the directories, the side folder, the transcript.
+    assert.deepEqual(result.created, [fileHistory(copy), uploads(copy), path.join(dir, copy), path.join(dir, `${copy}.jsonl`)]);
+    assert.equal(await readFile(path.join(fileHistory(copy), 'abc@v1'), 'utf8'), 'snapshot');
+    assert.ok((await readFile(path.join(uploads(copy), 'a.png'))).equals(Buffer.from([1, 2, 3])));
+    assert.equal(await readFile(path.join(fileHistory(id), 'abc@v1'), 'utf8'), 'snapshot', 'the original is untouched');
+
+    // With the transcript and side folder gone, the directories alone make a fresh copy a conflict.
+    await rm(path.join(dir, `${copy}.jsonl`));
+    await rm(path.join(dir, copy), { recursive: true });
+    await assert.rejects(
+      () => copyOnHost(run, TARGET, request),
+      (error: unknown) => error instanceof HostStepError && error.kind === 'conflict' && /file-history/.test(error.message),
+    );
+
+    // An update keeps the old directories aside under its tag and writes fresh ones.
+    await writeFile(path.join(fileHistory(copy), 'abc@v1'), 'older');
+    const again = await probeHost(run, TARGET, { sourceCliSessionId: id, targetCliSessionId: copy });
+    assert.deepEqual(again.targetDirs, ['file-history', 'uploads']);
+    const update = await copyOnHost(run, TARGET, { ...request, existingDirs: again.targetDirs, replaceTag: 'J2' });
+    assert.deepEqual(update.moved, [fileHistory(copy), uploads(copy)]);
+    assert.equal(await readFile(path.join(`${fileHistory(copy)}.ccas-backup-J2`, 'abc@v1'), 'utf8'), 'older');
+    assert.equal(await readFile(path.join(fileHistory(copy), 'abc@v1'), 'utf8'), 'snapshot');
+
+    // Undo sets the fresh directories aside and brings the kept ones back.
+    const undone = await undoOnHost(run, TARGET, {
+      created: update.created,
+      moved: update.moved.map((from) => ({ from, to: `${from}.ccas-backup-J2` })),
+      tag: 'R2',
+    });
+    assert.deepEqual(undone.warnings, []);
+    assert.equal(await readFile(path.join(fileHistory(copy), 'abc@v1'), 'utf8'), 'older');
+    assert.ok(await pathExists(`${uploads(copy)}.ccas-removed-R2`), 'the fresh directory is set aside, not deleted');
     // Steps an interrupted operation announced but never took are skipped.
     const never = path.join(dir, `${randomUUID()}.jsonl`);
     const skipped = await undoOnHost(run, TARGET, { created: [never], moved: [{ from: never, to: `${never}.ccas-backup-J2` }], tag: 'R2' });
@@ -184,7 +257,9 @@ describe('ssh host', () => {
 
   it('refuses ids and tags that are not plain names', async () => {
     const id = randomUUID();
-    await assert.rejects(() => copyOnHost(run, TARGET, { dir, sourceCliSessionId: id, targetCliSessionId: '../x' }), /refusing/);
-    await assert.rejects(() => copyOnHost(run, TARGET, { dir, sourceCliSessionId: id, targetCliSessionId: randomUUID(), replaceTag: 'a b' }), /refusing/);
+    await assert.rejects(() => copyOnHost(run, TARGET, { ...plain, sourceCliSessionId: id, targetCliSessionId: '../x' }), /refusing/);
+    await assert.rejects(() => copyOnHost(run, TARGET, { ...plain, sourceCliSessionId: id, targetCliSessionId: randomUUID(), replaceTag: 'a b' }), /refusing/);
+    // A per-session directory name comes from the probe's output; only the three the CLI keeps are ever used in a script.
+    await assert.rejects(() => copyOnHost(run, TARGET, { ...plain, sourceCliSessionId: id, targetCliSessionId: randomUUID(), dirs: ['../projects'] }), /refusing/);
   });
 });

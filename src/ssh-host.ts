@@ -34,6 +34,16 @@
 // beyond it (newer lines, the tombstones) reaches the mirror with the app's
 // next sync.
 //
+// The directories the CLI keeps per session outside projects/ on the host
+// (transcripts.ts, SESSION_KEYED_DIRS: file-history/<id>, uploads/<id>,
+// image-cache/<id>) come along the same way, as plain copies under the new
+// id (since 2026-10-05; before that a /rewind in the copy found no
+// checkpoints on the host). The probe reports the host's CLI directory and
+// which of those directories the original has, the copy script builds them
+// under temporary names and moves them into place before the side folder
+// and the transcript, and the journal names them before the script runs, so
+// an undo sets them aside like everything else the copy created.
+//
 // How the host is reached: the Mac's own ssh with the record's sshConfig
 // (host, port, key file), which is also what the app uses, in batch mode so
 // that nothing ever waits for a password. The work is a POSIX sh script sent
@@ -52,6 +62,7 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import type { SessionRecord } from './records.ts';
+import { SESSION_KEYED_DIRS, type SessionKeyedDirName } from './transcripts.ts';
 
 /** How to reach the host of an SSH conversation (from the record's sshConfig). */
 export interface HostTarget {
@@ -181,6 +192,14 @@ function assertId(value: string, what: string): void {
   if (!ID_RE.test(value)) throw new Error(`refusing to use ${JSON.stringify(value)} as a ${what} on the host`);
 }
 
+/** A per-session directory name is one of SESSION_KEYED_DIRS; anything else (from a journal or a probe) never reaches a script. */
+function assertSessionKeyedDir(name: string): SessionKeyedDirName {
+  if (!(SESSION_KEYED_DIRS as readonly string[]).includes(name)) {
+    throw new Error(`refusing to use ${JSON.stringify(name)} as a per-session directory on the host`);
+  }
+  return name as SessionKeyedDirName;
+}
+
 /**
  * Lines every script starts with: stop on unset variables, private files
  * (transcripts are 0600, as the CLI writes them), byte semantics for sed and
@@ -279,6 +298,12 @@ export interface HostProbe {
   targetSidecar: string | null;
   /** claude.ai sessions the copy's transcript on the host still links up with (see LIVE_AWK); empty when none. */
   targetLive: string[];
+  /** The host's CLI directory (CLAUDE_CONFIG_DIR there, else ~/.claude), where the per-session directories live; null only when the host ran an older probe. */
+  claudeDir: string | null;
+  /** Names of SESSION_KEYED_DIRS the original has on the host. */
+  sourceDirs: string[];
+  /** Names of SESSION_KEYED_DIRS the copy already has on the host: a conflict for a fresh copy, kept aside by an update. */
+  targetDirs: string[];
 }
 
 export interface ProbeRequest {
@@ -306,6 +331,12 @@ export function probeScript(request: ProbeRequest): string {
     `OLD=${shQuote(request.sourceCliSessionId)}`,
     `NEW=${shQuote(request.targetCliSessionId)}`,
     `HINT=${shQuote(request.hint ?? '')}`,
+    'echo "CCAS_CLAUDE_DIR:$C"',
+    // The per-session directories of the original and of the copy, by name.
+    ...SESSION_KEYED_DIRS.flatMap((name) => [
+      `[ -d "$C/${name}/$OLD" ] && echo "CCAS_SOURCE_DIR:${name}"`,
+      `[ -e "$C/${name}/$NEW" ] && echo "CCAS_TARGET_DIR:${name}"`,
+    ]),
     'P=""',
     'case "$HINT" in */"$OLD.jsonl") [ -f "$HINT" ] && P=$HINT ;; esac',
     'if [ -z "$P" ]; then P=$(find -L "$C/projects" -name "$OLD.jsonl" -type f 2>/dev/null | head -n 1); fi',
@@ -368,14 +399,23 @@ export async function probeHost(runner: HostRunner, target: HostTarget, request:
     target: markerValues(result.stdout, 'CCAS_TARGET').at(0) ?? null,
     targetSidecar: markerValues(result.stdout, 'CCAS_TARGET_SIDECAR').at(0) ?? null,
     targetLive: markerValues(result.stdout, 'CCAS_TARGET_LIVE'),
+    claudeDir: markerValues(result.stdout, 'CCAS_CLAUDE_DIR').at(0) ?? null,
+    sourceDirs: markerValues(result.stdout, 'CCAS_SOURCE_DIR'),
+    targetDirs: markerValues(result.stdout, 'CCAS_TARGET_DIR'),
   };
 }
 
 export interface HostCopyRequest {
   /** Folder of the original on the host (HostProbe.dir); the copy goes next to it. */
   dir: string;
+  /** The host's CLI directory (HostProbe.claudeDir), where the per-session directories live. */
+  claudeDir: string;
   sourceCliSessionId: string;
   targetCliSessionId: string;
+  /** Names of SESSION_KEYED_DIRS to copy from the original (HostProbe.sourceDirs). */
+  dirs: readonly string[];
+  /** Names of SESSION_KEYED_DIRS the copy already has (HostProbe.targetDirs): an update keeps them aside, a fresh copy must not see any. */
+  existingDirs: readonly string[];
   /**
    * Set when the copy replaces an existing one (an update): the old
    * transcript and side folder are kept as "<path>.ccas-backup-<tag>". Without
@@ -384,52 +424,96 @@ export interface HostCopyRequest {
   replaceTag?: string | null | undefined;
 }
 
-/** The paths a copy creates on the host, and where replaced ones are kept; for the journal, which records them first. */
-export function hostCopyPaths(request: HostCopyRequest, sidecar: boolean): { transcript: string; sidecar: string | null; backupSuffix: string | null } {
+/**
+ * The paths a copy creates on the host (per-session directories first, then
+ * the side folder, then the transcript, the order the script moves them
+ * into place and announces them), the per-session directories an update
+ * keeps aside, and the suffix they are kept under; for the journal, which
+ * records all of it before the script runs.
+ */
+export function hostCopyPaths(
+  request: HostCopyRequest,
+  sidecar: boolean,
+): { transcript: string; sidecar: string | null; dirs: string[]; existingDirs: string[]; backupSuffix: string | null } {
+  const dirPath = (name: string): string => path.posix.join(request.claudeDir, assertSessionKeyedDir(name), request.targetCliSessionId);
   return {
     transcript: path.posix.join(request.dir, `${request.targetCliSessionId}.jsonl`),
     sidecar: sidecar ? path.posix.join(request.dir, request.targetCliSessionId) : null,
+    dirs: request.dirs.map(dirPath),
+    existingDirs: request.existingDirs.map(dirPath),
     backupSuffix: request.replaceTag ? `.ccas-backup-${request.replaceTag}` : null,
   };
 }
 
 /**
  * Makes the copy on the host: the original's transcript with the id
- * rewritten and tombstones appended, and its side folder with the id
- * rewritten, both built under temporary names and moved into place at the
- * end. The transcript comes last: the CLI resumes a session only once its
- * transcript exists, so nothing can start the copy before it is complete.
- * Exit codes: 3 the original is gone, 5 a write failed, 6 the target exists
- * (or appeared meanwhile).
+ * rewritten and tombstones appended, its side folder with the id rewritten,
+ * and its per-session directories (file-history, uploads, image-cache) as
+ * they are, all built under temporary names and moved into place at the
+ * end, in that order reversed: the per-session directories first, then the
+ * side folder, the transcript last. The CLI resumes a session only once its
+ * transcript exists, so nothing can start the copy before everything it
+ * refers to is complete. Exit codes: 3 the original is gone, 5 a write
+ * failed, 6 the target exists (or appeared meanwhile).
  */
 export function copyScript(request: HostCopyRequest): string {
   assertId(request.sourceCliSessionId, 'session id');
   assertId(request.targetCliSessionId, 'session id');
   const tag = request.replaceTag ?? '';
   if (tag !== '' && !TAG_RE.test(tag)) throw new Error(`refusing to use ${JSON.stringify(tag)} as a backup tag on the host`);
+  // One set of shell variables per per-session directory: the original's
+  // (SD<n>), the copy's (TD<n>) and the temporary name the copy is built
+  // under (TT<n>); fail() removes every temporary one.
+  const dirs = [...new Set([...request.dirs, ...request.existingDirs])].map((name, index) => ({
+    name: assertSessionKeyedDir(name),
+    copy: request.dirs.includes(name),
+    existing: request.existingDirs.includes(name),
+    sd: `$SD${index}`,
+    td: `$TD${index}`,
+    tt: `$TT${index}`,
+  }));
   return [
     ...PRELUDE,
     ...TOMBSTONE_FUNCTION,
     ...COPY_TREE_FUNCTION,
     `D=${shQuote(request.dir)}`,
+    `K=${shQuote(request.claudeDir)}`,
     `OLD=${shQuote(request.sourceCliSessionId)}`,
     `NEW=${shQuote(request.targetCliSessionId)}`,
     `TAG=${shQuote(tag)}`,
     'P="$D/$OLD.jsonl"; F="$D/$NEW.jsonl"; S="$D/$OLD"; SN="$D/$NEW"',
     'T="$F.ccas-tmp.$$"; ST="$SN.ccas-tmp.$$"; LIST="$SN.ccas-tmp.$$.list"',
-    'fail() { rm -f "$T" "$LIST"; rm -rf "$ST"; echo "CCAS_ERROR:$2"; exit "$1"; }',
+    ...dirs.map((dir, index) => `SD${index}="$K/${dir.name}/$OLD"; TD${index}="$K/${dir.name}/$NEW"; TT${index}="$K/${dir.name}/$NEW.ccas-tmp.$$"`),
+    `fail() { rm -f "$T" "$LIST"; rm -rf "$ST"${dirs.map((dir) => ` "${dir.tt}"`).join('')}; echo "CCAS_ERROR:$2"; exit "$1"; }`,
     '[ -f "$P" ] || fail 3 "the transcript $P is not there any more"',
     'if [ -z "$TAG" ]; then',
     '  [ -e "$F" ] && fail 6 "$F exists already"',
     '  [ -e "$SN" ] && fail 6 "$SN exists already"',
+    ...dirs.filter((dir) => dir.copy).map((dir) => `  [ -e "${dir.td}" ] && fail 6 "${dir.td} exists already"`),
     'fi',
     'sed "s/$OLD/$NEW/g" "$P" > "$T" || fail 5 "could not write $T"',
     'tombstones "$T" "$T" || fail 5 "could not end the Remote Control link in $T"',
     'if [ -d "$S" ]; then copy_tree "$S" "$ST" "$LIST" || fail 5 "could not copy $S"; rm -f "$LIST"; fi',
+    // The per-session directories hold no session id inside, so they are
+    // copied as they are (cp -p keeps the permission bits), under temporary
+    // names like the rest.
+    ...dirs.filter((dir) => dir.copy).map((dir) => `if [ -d "${dir.sd}" ]; then cp -pR "${dir.sd}" "${dir.tt}" || fail 5 "could not copy ${dir.sd}"; fi`),
     'if [ -n "$TAG" ]; then',
     '  if [ -e "$F" ]; then mv "$F" "$F.ccas-backup-$TAG" || fail 5 "could not keep $F aside"; echo "CCAS_MOVED:$F"; fi',
     '  if [ -e "$SN" ]; then mv "$SN" "$SN.ccas-backup-$TAG" || fail 5 "could not keep $SN aside"; echo "CCAS_MOVED:$SN"; fi',
+    ...dirs
+      .filter((dir) => dir.existing)
+      .map((dir) => `  if [ -e "${dir.td}" ]; then mv "${dir.td}" "${dir.td}.ccas-backup-$TAG" || fail 5 "could not keep ${dir.td} aside"; echo "CCAS_MOVED:${dir.td}"; fi`),
     'fi',
+    // Into place: the per-session directories first, then the side folder,
+    // the transcript last, so a transcript the CLI could resume never exists
+    // before what it refers to.
+    ...dirs
+      .filter((dir) => dir.copy)
+      .map(
+        (dir) =>
+          `if [ -d "${dir.tt}" ]; then [ -e "${dir.td}" ] && fail 6 "${dir.td} appeared meanwhile"; mv "${dir.tt}" "${dir.td}" || fail 5 "could not create ${dir.td}"; echo "CCAS_CREATED:${dir.td}"; fi`,
+      ),
     'if [ -d "$ST" ]; then',
     '  [ -e "$SN" ] && fail 6 "$SN appeared meanwhile"',
     '  mv "$ST" "$SN" || fail 5 "could not create $SN"',

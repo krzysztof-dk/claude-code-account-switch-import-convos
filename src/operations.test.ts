@@ -20,6 +20,7 @@ import {
   readJson,
   readTree,
   replaceInBytes,
+  sessionKeyedFixtureFiles,
   sshRecordFields,
   unreachableHostRunner,
   writeHostTranscript,
@@ -166,7 +167,8 @@ describe('operations', () => {
     assert.ok(await pathExists(path.join(source.transcript.projectDir, outcome.newCliSessionId!, 'tool-results', 'result1.txt')));
     const entry = await state.context.journal.get(outcome.journalId!);
     assert.equal(entry?.status, 'done');
-    assert.equal(entry?.created.length, 3);
+    // Transcript, side folder, file-history and uploads directories, record.
+    assert.equal(entry?.created.length, 5);
     assert.equal(entry?.backedUp.length, 0);
     assert.equal(state.context.lineage.byRoot(source.key).length, 1);
     // The source stayed exactly as it was.
@@ -194,9 +196,17 @@ describe('operations', () => {
     assert.equal(after.cliSessionId, before.cliSessionId);
     assert.deepEqual(after.summary?.uuidChain, listed(ACCOUNT_A, 'R1').summary?.uuidChain);
     const entry = await state.context.journal.get(outcome.journalId!);
-    // The record is backed up; the old transcript and sidecar are moved into the backup whole.
+    // The record is backed up; the old transcript, sidecar and per-session directories are moved into the backup whole.
     assert.equal(entry?.backedUp.length, 1);
-    assert.deepEqual(entry?.moved.map((move) => move.from), [before.transcript!.path, before.transcript!.sidecarDir!]);
+    assert.deepEqual(
+      entry?.moved.map((move) => move.from),
+      [
+        before.transcript!.path,
+        before.transcript!.sidecarDir!,
+        path.join(state.world.paths.claudeDir, 'file-history', before.cliSessionId!),
+        path.join(state.world.paths.claudeDir, 'uploads', before.cliSessionId!),
+      ],
+    );
     assert.ok(entry?.backupDir);
     const backedTranscript = path.join(entry.backupDir, ...before.transcript!.path.split(path.sep).filter(Boolean));
     assert.equal((await summarizeTranscript(backedTranscript)).uuidChain.length, before.summary?.uuidChain.length);
@@ -315,12 +325,16 @@ describe('operations', () => {
     assert.equal((await context.journal.get(created.journalId!))?.status, 'done');
     const preview = await restoreEntry({ ...context, dryRun: true }, created.journalId!);
     assert.equal(preview.dryRun, true);
-    assert.equal(preview.steps.length, 3);
+    // One removal per created path: record, uploads, file-history, side folder, transcript.
+    assert.equal(preview.steps.length, 5);
     assert.ok(await pathExists(createdRecord));
 
     const restored = await restoreEntry(context, created.journalId!);
-    assert.equal(restored.steps.length, 3);
+    assert.equal(restored.steps.length, 5);
     assert.equal(await pathExists(createdRecord), false);
+    for (const dir of ['file-history', 'uploads']) {
+      assert.equal(await pathExists(path.join(world.paths.claudeDir, dir, created.newCliSessionId!)), false, `${dir} of the copy is gone`);
+    }
     assert.equal(await pathExists(path.join(t.projectDir, `${created.newCliSessionId}.jsonl`)), false);
     assert.equal((await context.journal.get(created.journalId!))?.status, 'restored');
     await assert.rejects(() => restoreEntry(context, created.journalId!), /already restored/);
@@ -422,6 +436,37 @@ describe('operations', () => {
     assert.equal(account(ACCOUNT_B).email, EMAIL_B);
     assert.equal(account(ACCOUNT_A).email, EMAIL_A);
   });
+
+  it('a copy carries the session-keyed directories (file-history, uploads) under the new id', async () => {
+    // The CLI keeps checkpoint backups and Remote Control attachments under
+    // ~/.claude/<dir>/<cliSessionId>/. A copy with a new id needs its own,
+    // otherwise /rewind in the copy fails with "No files were restored" and
+    // attachment paths rewritten to the new id lead nowhere.
+    const world = state.world;
+    const t = await writeTranscript(world, { prompts: 1, title: 'T-dirs' });
+    await writeRecord(world, world.a, { cliSessionId: t.cliId, title: 'R-dirs' });
+    await rebuild();
+    const outcome = await transfer(listed(ACCOUNT_A, 'R-dirs'), account(ACCOUNT_B), 'copy');
+    assert.equal(outcome.action, 'created');
+    const newCli = outcome.newCliSessionId!;
+    for (const file of sessionKeyedFixtureFiles(t.cliId)) {
+      const copied = path.join(world.paths.claudeDir, file.rel.split(t.cliId).join(newCli));
+      assert.ok(await pathExists(copied), copied);
+      assert.ok((await readFile(copied)).equals(file.bytes), copied);
+      assert.ok((await readFile(path.join(world.paths.claudeDir, file.rel))).equals(file.bytes), 'the original is untouched');
+    }
+    const entry = await state.context.journal.get(outcome.journalId!);
+    for (const dir of ['file-history', 'uploads']) {
+      assert.ok(entry?.created.includes(path.join(world.paths.claudeDir, dir, newCli)), `${dir} announced in the journal`);
+    }
+    // Undoing the copy takes the directories away with it.
+    await restoreEntry(state.context, outcome.journalId!);
+    for (const dir of ['file-history', 'uploads']) {
+      assert.equal(await pathExists(path.join(world.paths.claudeDir, dir, newCli)), false, dir);
+      assert.ok(await pathExists(path.join(world.paths.claudeDir, dir, t.cliId)), `${dir} of the original stays`);
+    }
+    await rebuild();
+  });
 });
 
 /** A journal that stops accepting updates after the first few, as the disk does for a process that lost power. */
@@ -458,10 +503,14 @@ describe('operations: SSH sessions', () => {
   };
   /** A transcript on the fake host, by CLI session id. */
   const onHost = (cli: string): string => path.join(hostProjectDir(state.world), `${cli}.jsonl`);
+  /** A per-session directory (file-history, uploads) on the fake host, by CLI session id. */
+  const onHostDir = (name: string, cli: string): string => path.join(hostHome(state.world), '.claude', name, cli);
   /** Undoes what copies got on 2026-09-28, making a copy look like one made before: no host transcript, Remote Control as the source had it. */
   const makeOldStyle = async (copy: Conversation, record: Partial<SessionRecord>): Promise<void> => {
     await rm(onHost(copy.cliSessionId!), { force: true });
     await rm(path.join(hostProjectDir(state.world), copy.cliSessionId!), { recursive: true, force: true });
+    // Copies made before 2026-10-05 got no per-session directories on the host either.
+    for (const name of ['file-history', 'uploads']) await rm(onHostDir(name, copy.cliSessionId!), { recursive: true, force: true });
     const saved = await readJson<SessionRecord>(copy.record!.path);
     delete saved['remoteControlUserEnabled'];
     delete saved['remoteControlUserToggled'];
@@ -545,9 +594,10 @@ describe('operations: SSH sessions', () => {
     assert.equal((await stat(recordPath)).mode & 0o777, 0o600);
     const entry = await state.context.journal.get(outcome.journalId!);
     assert.deepEqual(entry?.created, [mirror, recordPath]);
+    // Announced in the order the host script puts them in place: per-session directories, side folder, transcript.
     assert.deepEqual(entry?.remote, {
       host: { host: SSH_HOST },
-      created: [path.join(hostProjectDir(state.world), newCli), onHost(newCli)],
+      created: [onHostDir('file-history', newCli), onHostDir('uploads', newCli), path.join(hostProjectDir(state.world), newCli), onHost(newCli)],
       moved: [],
       tombstoned: [],
     });
@@ -590,6 +640,8 @@ describe('operations: SSH sessions', () => {
     assert.deepEqual(entry?.remote?.moved, [
       { from: onHost(cli), to: `${onHost(cli)}.ccas-backup-${outcome.journalId}` },
       { from: sideDir, to: `${sideDir}.ccas-backup-${outcome.journalId}` },
+      { from: onHostDir('file-history', cli), to: `${onHostDir('file-history', cli)}.ccas-backup-${outcome.journalId}` },
+      { from: onHostDir('uploads', cli), to: `${onHostDir('uploads', cli)}.ccas-backup-${outcome.journalId}` },
     ]);
     const grown = await readFile(onHost(cli));
     assert.ok(grown.length > hostBefore.length);
@@ -853,5 +905,95 @@ describe('operations: SSH sessions', () => {
     assert.deepEqual(await recordsIn(state.world.b.dir), recordsBefore);
     assert.equal((await state.context.journal.get(entry.id))?.status, 'restored');
     assert.deepEqual(await state.context.journal.interrupted(), []);
+  });
+
+  it('an SSH copy gets the session-keyed directories on the host, next to its transcript', async () => {
+    // The CLI that edits files and receives attachments runs on the host, so
+    // that is where file-history/<id> and uploads/<id> live for an SSH
+    // conversation; the copy needs them there under its own id.
+    const written = await addSshConversation('S-dirs', { prompts: 1 });
+    await rebuild();
+    const outcome = await transfer(listed(ACCOUNT_A, 'S-dirs'), account(ACCOUNT_B), 'copy');
+    assert.equal(outcome.action, 'created');
+    const newCli = outcome.newCliSessionId!;
+    const hostClaude = path.join(hostHome(state.world), '.claude');
+    for (const file of sessionKeyedFixtureFiles(written.cliId)) {
+      const copied = path.join(hostClaude, file.rel.split(written.cliId).join(newCli));
+      assert.ok(await pathExists(copied), copied);
+      assert.ok((await readFile(copied)).equals(file.bytes), copied);
+      assert.ok((await readFile(path.join(hostClaude, file.rel))).equals(file.bytes), 'the original on the host is untouched');
+    }
+    const entry = await state.context.journal.get(outcome.journalId!);
+    for (const dir of ['file-history', 'uploads']) {
+      assert.ok(entry?.remote?.created.includes(path.join(hostClaude, dir, newCli)), `${dir} announced in the journal before the host script ran`);
+    }
+    const restored = await restoreEntry(state.context, outcome.journalId!);
+    for (const dir of ['file-history', 'uploads']) {
+      assert.ok(restored.steps.some((step) => step.includes(path.join(hostClaude, dir, newCli))), `${dir} set aside on the host`);
+      assert.equal(await pathExists(path.join(hostClaude, dir, newCli)), false, dir);
+      assert.ok(await pathExists(path.join(hostClaude, dir, written.cliId)), `${dir} of the original stays`);
+    }
+    await rebuild();
+  });
+});
+
+describe('operations: lineage links for moves', () => {
+  const { state, rebuild, account, listed, transfer } = harness({ withLineage: true });
+
+  before(async () => {
+    state.world = await makeWorld();
+    const world = state.world;
+    state.context = { paths: world.paths, journal: new Journal(world.paths.dataDir), lineage: await LineageStore.load(world.paths.dataDir), dryRun: false };
+    const t = await writeTranscript(world, { prompts: 2, email: EMAIL_A, title: 'T-move' });
+    await writeRecord(world, world.a, { cliSessionId: t.cliId, title: 'R-move' });
+    await rebuild();
+  });
+  after(async () => {
+    await destroyWorld(state.world);
+  });
+
+  it('a move writes a lineage link naming both accounts', async () => {
+    const source = listed(ACCOUNT_A, 'R-move');
+    assert.ok(source.record && source.summary);
+    const outcome = await transfer(source, account(ACCOUNT_B), 'move');
+    assert.equal(outcome.action, 'moved');
+    const link = state.context.lineage.all().at(-1);
+    assert.ok(link, 'the move left a link');
+    assert.equal(link.mode, 'move');
+    assert.equal(link.action, 'moved');
+    assert.equal(link.journalId, outcome.journalId);
+    assert.equal(link.sourceLineCount, source.summary.lineCount);
+    const sessionId = source.record.record.sessionId;
+    assert.deepEqual(link.source, { accountId: ACCOUNT_A.accountId, orgId: ACCOUNT_A.orgId, sessionId, cliSessionId: source.cliSessionId });
+    assert.deepEqual(link.target, { accountId: ACCOUNT_B.accountId, orgId: ACCOUNT_B.orgId, sessionId, cliSessionId: source.cliSessionId });
+  });
+
+  it('a moved record does not lend its e-mail to the target after the app dropped the stamp', async () => {
+    // The app writes records from the list of fields it knows, so the ccas
+    // stamp is gone the first time it saves the moved record. The link the
+    // move wrote is then the only thing that keeps the session_context lines
+    // of the source account from voting for the target account.
+    const moved = listed(ACCOUNT_B, 'R-move');
+    assert.ok(moved.record);
+    assert.ok(moved.record.record.ccas, 'the stamp is there right after the move');
+    assert.equal(account(ACCOUNT_B).email, null);
+    const saved = structuredClone(moved.record.record);
+    delete saved.ccas;
+    await writeFile(moved.record.path, JSON.stringify(saved, null, 2));
+    await rebuild();
+    assert.equal(account(ACCOUNT_B).email, null, 'the source account e-mail must not become the target account e-mail');
+    assert.equal(account(ACCOUNT_A).email, EMAIL_A);
+  });
+
+  it('restore of a move leaves the link harmless', async () => {
+    const entry = (await state.context.journal.list()).find((candidate) => candidate.mode === 'move');
+    assert.ok(entry);
+    await restoreEntry(state.context, entry.id);
+    await rebuild();
+    const back = listed(ACCOUNT_A, 'R-move');
+    const again = await transfer(back, account(ACCOUNT_B), 'move');
+    assert.equal(again.action, 'moved');
+    assert.equal(state.context.lineage.all().filter((link) => link.mode === 'move').length, 2);
+    assert.equal(account(ACCOUNT_B).email, null);
   });
 });
