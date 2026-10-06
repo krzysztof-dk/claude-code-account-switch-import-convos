@@ -10,6 +10,7 @@ import path from 'node:path';
 import { writeFileAtomic } from './fsx.ts';
 import type { TranscriptSummary } from './transcripts.ts';
 
+/** File name of the summary cache in the tool's data directory (<dataDir>/summary-cache.json). */
 export const SUMMARY_CACHE_FILE_NAME = 'summary-cache.json';
 const CACHE_VERSION = 3;
 

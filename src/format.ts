@@ -5,6 +5,10 @@ import type { AccountInfo } from './accounts.ts';
 import { accountLabel } from './accounts.ts';
 import type { Conversation, SyncAssessment, SyncState } from './inventory.ts';
 
+/**
+ * Epoch milliseconds as "YYYY-MM-DD HH:MM" in local time, for date columns;
+ * a dash when the time is unknown (null, zero, negative or not finite).
+ */
 export function formatWhen(ms: number | null): string {
   if (ms === null || !Number.isFinite(ms) || ms <= 0) return '-';
   const date = new Date(ms);
@@ -12,6 +16,10 @@ export function formatWhen(ms: number | null): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+/**
+ * A byte count for size columns, 1024-based: bytes below 1 KiB, whole
+ * kilobytes below 1 MiB, megabytes with one decimal from there on.
+ */
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
@@ -25,6 +33,11 @@ export function shortenPath(target: string | null, max = 36): string {
   return `...${target.slice(target.length - (max - 3))}`;
 }
 
+/**
+ * Fits free text such as a title into a column: every run of whitespace
+ * (newlines included) becomes one space, and text longer than `max` is cut
+ * to exactly `max` characters ending in "...".
+ */
 export function truncate(text: string, max: number): string {
   const clean = text.replace(/\s+/g, ' ').trim();
   return clean.length <= max ? clean : `${clean.slice(0, max - 3)}...`;
@@ -48,6 +61,10 @@ export function renderTable(rows: readonly (readonly string[])[], header = true)
   return lines.join('\n');
 }
 
+/**
+ * The words for a sync state, as the README's "States" table names them;
+ * shown in lists, plans and the hint column of the TUI.
+ */
 export function describeState(state: SyncState): string {
   switch (state) {
     case 'new':
@@ -89,6 +106,12 @@ export function describeComparison(assessment: SyncAssessment): string {
   }
 }
 
+/**
+ * The origin label of a conversation (README, "Origin of a conversation").
+ * For remote-control and claude.ai it adds the owner on the claude.ai side:
+ * the account's label when the owner is a known account, else the start of
+ * its uuid.
+ */
 export function describeOrigin(conversation: Conversation, accounts: readonly AccountInfo[]): string {
   const owner = conversation.bridgeOwner;
   const ownerLabel = owner
@@ -111,6 +134,7 @@ export function describeOrigin(conversation: Conversation, accounts: readonly Ac
   }
 }
 
+/** The flags of a conversation as words, comma separated; empty when it has none. */
 export function describeFlags(conversation: Conversation): string {
   return conversation.flags
     .map((flag) => {
@@ -128,6 +152,11 @@ export function describeFlags(conversation: Conversation): string {
     .join(', ');
 }
 
+/**
+ * One row of the account table of `ccas accounts` and the TUI, in the
+ * column order of ACCOUNT_HEADER; the uuids are cut to their first eight
+ * characters.
+ */
 export function accountRow(account: AccountInfo): string[] {
   return [
     account.name ?? '-',
@@ -141,4 +170,5 @@ export function accountRow(account: AccountInfo): string[] {
   ];
 }
 
+/** Column titles of the account table; accountRow fills the same columns in the same order. */
 export const ACCOUNT_HEADER = ['name', 'e-mail', 'evidence', 'account', 'org', 'organization', 'sessions', 'logged in'];

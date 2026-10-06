@@ -38,6 +38,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { writeFileAtomic } from './fsx.ts';
 
+/** Start of every record id and record file name ("local_<uuid>"), as the desktop app names them. */
 export const RECORD_PREFIX = 'local_';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -80,6 +81,12 @@ export interface SshConfig {
   [key: string]: unknown;
 }
 
+/**
+ * A record as the desktop app writes it. The fields this tool reads are
+ * named; every other field is kept as it is (the index signature), so a
+ * record keeps what the tool does not set. parseRecord accepts what the
+ * app accepts.
+ */
 export interface SessionRecord {
   sessionId: string;
   createdAt: number;
@@ -111,16 +118,27 @@ export interface SessionRecord {
   [key: string]: unknown;
 }
 
+/**
+ * A record read from an account directory, with the path and file name it
+ * came from; readRecords returns these and each listed Conversation keeps
+ * one.
+ */
 export interface LoadedRecord {
   path: string;
   fileName: string;
   record: SessionRecord;
 }
 
+/**
+ * Whether a value is a uuid string (8-4-4-4-12 hex digits, any case).
+ * Account and organization directories, CLI session ids and the ids of the
+ * CLI login are checked with it.
+ */
 export function isUuid(value: unknown): value is string {
   return typeof value === 'string' && UUID_RE.test(value);
 }
 
+/** Whether a file name in an account directory is one the app loads as a record (local_*.json). */
 export function isRecordFileName(name: string): boolean {
   return name.startsWith(RECORD_PREFIX) && name.endsWith('.json');
 }
@@ -528,6 +546,11 @@ export function unknownFields(record: SessionRecord): string[] {
     .sort();
 }
 
+/**
+ * Reads every record of one account directory, in file name order. A file
+ * the app would skip (unreadable, not JSON, a required field missing) is
+ * left out and named in `problems`; a missing directory gives no records.
+ */
 export async function readRecords(accountDir: string): Promise<{ records: LoadedRecord[]; problems: string[] }> {
   const records: LoadedRecord[] = [];
   const problems: string[] = [];
@@ -557,14 +580,21 @@ export async function readRecords(accountDir: string): Promise<{ records: Loaded
   return { records, problems };
 }
 
+/** A fresh record id for a copy, in the form the app uses (local_<uuid>). */
 export function newLocalSessionId(): string {
   return `${RECORD_PREFIX}${randomUUID()}`;
 }
 
+/** The file name a record is kept under: its id plus ".json". */
 export function recordFileName(sessionId: string): string {
   return `${sessionId}.json`;
 }
 
+/**
+ * Writes a record atomically (temporary file, then rename) with the
+ * permission bits of the app's own records, as indented JSON with a final
+ * newline.
+ */
 export async function writeRecord(filePath: string, record: SessionRecord): Promise<void> {
   await writeFileAtomic(filePath, `${JSON.stringify(record, null, 2)}\n`, { mode: RECORD_FILE_MODE });
 }
