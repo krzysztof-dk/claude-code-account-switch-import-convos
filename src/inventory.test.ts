@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { appendFile, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import {
   ACCOUNT_A,
@@ -10,6 +11,7 @@ import {
   appendRounds,
   buildTranscriptLines,
   destroyWorld,
+  encodeCwd,
   makeWorld,
   readJson,
   writeRecord,
@@ -18,7 +20,17 @@ import {
   type WrittenTranscript,
 } from '../test/fixtures.ts';
 import { AccountStore, accountKey } from './accounts.ts';
-import { assessSync, buildInventory, conversationsOf, type Conversation, type Inventory } from './inventory.ts';
+import {
+  assessSync,
+  buildInventory,
+  conversationsOf,
+  describeTranscript,
+  endpointOf,
+  isSameConversation,
+  refersTo,
+  type Conversation,
+  type Inventory,
+} from './inventory.ts';
 import { LineageStore } from './lineage.ts';
 import { copyRewritingSessionId } from './transcripts.ts';
 
@@ -240,5 +252,99 @@ describe('inventory', () => {
     } finally {
       await destroyWorld(own);
     }
+  });
+});
+
+describe('inventory: how conversations are named and paired', () => {
+  let world: World;
+  let inventory: Inventory;
+  /** R1 on account A, with a transcript. */
+  let listedA: Conversation;
+  /** A record on account B with the same record id as R1: what a move leaves. */
+  let movedB: Conversation;
+  /** A record on account B with nothing in common with R1. */
+  let otherB: Conversation;
+  /** A record on account A whose transcript is missing. */
+  let bare: Conversation;
+  /** A transcript no record points at. */
+  let unlisted: Conversation;
+  let t1: WrittenTranscript;
+
+  const find = (list: readonly Conversation[], title: string): Conversation => {
+    const found = list.find((conversation) => conversation.title === title);
+    assert.ok(found, title);
+    return found;
+  };
+
+  before(async () => {
+    world = await makeWorld();
+    t1 = await writeTranscript(world, { prompts: 1, email: EMAIL_A, title: 'T1' });
+    const { record } = await writeRecord(world, world.a, { cliSessionId: t1.cliId, title: 'R1' });
+    const moved = await writeTranscript(world, { prompts: 1, email: null });
+    await writeRecord(world, world.b, { cliSessionId: moved.cliId, sessionId: record.sessionId, title: 'R1 moved' });
+    const other = await writeTranscript(world, { prompts: 1, email: null });
+    await writeRecord(world, world.b, { cliSessionId: other.cliId, title: 'B other' });
+    await writeRecord(world, world.a, { cliSessionId: '99999999-9999-4999-8999-999999999999', title: 'R bare' });
+    await writeTranscript(world, { prompts: 1, email: null, entrypoint: 'cli', title: 'U terminal' });
+    inventory = await buildInventory(world.paths, { store: await AccountStore.load(world.paths.dataDir) });
+    listedA = find(conversationsOf(inventory, world.a), 'R1');
+    bare = find(conversationsOf(inventory, world.a), 'R bare');
+    movedB = find(conversationsOf(inventory, world.b), 'R1 moved');
+    otherB = find(conversationsOf(inventory, world.b), 'B other');
+    unlisted = find(inventory.unlisted, 'U terminal');
+  });
+  after(async () => {
+    await destroyWorld(world);
+  });
+
+  it('names a listed conversation by account, record id and CLI id, an unlisted one by its CLI id alone', () => {
+    assert.deepEqual(endpointOf(listedA), {
+      accountId: ACCOUNT_A.accountId,
+      orgId: ACCOUNT_A.orgId,
+      sessionId: listedA.record?.record.sessionId,
+      cliSessionId: t1.cliId,
+    });
+    assert.deepEqual(endpointOf(unlisted), { accountId: undefined, orgId: undefined, sessionId: undefined, cliSessionId: unlisted.cliSessionId });
+  });
+
+  it('lets an endpoint refer to a record only through its account and record id', () => {
+    const own = endpointOf(listedA);
+    assert.equal(refersTo(own, listedA), true);
+    // The CLI id does not count for a record: the app clears it when resuming a copy fails.
+    assert.equal(refersTo({ ...own, cliSessionId: 'something-else' }, listedA), true);
+    assert.equal(refersTo({ cliSessionId: t1.cliId }, listedA), false);
+    assert.equal(refersTo({ ...own, accountId: ACCOUNT_B.accountId }, listedA), false, 'another account');
+    assert.equal(refersTo({ ...own, orgId: ACCOUNT_B.orgId }, listedA), false, 'another organization');
+    // The moved record shares the record id but lives on account B.
+    assert.equal(refersTo(own, movedB), false);
+  });
+
+  it('lets an endpoint refer to an unlisted transcript only by CLI id, and never when it names an account or a record', () => {
+    const cliSessionId = unlisted.cliSessionId ?? 'missing';
+    assert.equal(refersTo({ cliSessionId }, unlisted), true);
+    assert.equal(refersTo({ cliSessionId: t1.cliId }, unlisted), false);
+    assert.equal(refersTo({ accountId: ACCOUNT_A.accountId, orgId: ACCOUNT_A.orgId, cliSessionId }, unlisted), false);
+    assert.equal(refersTo({ sessionId: 'local_whatever', cliSessionId }, unlisted), false);
+  });
+
+  it('pairs two conversations by the same record id, or by a link in either direction, and nothing else', () => {
+    assert.equal(isSameConversation(listedA, movedB), true, 'same record id');
+    assert.equal(isSameConversation(movedB, listedA), true);
+    assert.equal(isSameConversation(listedA, otherB), false, 'nothing in common');
+    assert.equal(isSameConversation(listedA, unlisted), false);
+    // A link known to one side only is enough, whichever side holds it.
+    const linkedFromB = { ...otherB, links: [endpointOf(listedA)] };
+    assert.equal(isSameConversation(listedA, linkedFromB), true);
+    assert.equal(isSameConversation(linkedFromB, listedA), true);
+    const linkedFromA = { ...listedA, links: [endpointOf(otherB)] };
+    assert.equal(isSameConversation(linkedFromA, otherB), true);
+    assert.equal(isSameConversation(otherB, linkedFromA), true);
+    // An unlisted transcript pairs through a link naming its CLI id.
+    assert.equal(isSameConversation({ ...otherB, links: [endpointOf(unlisted)] }, unlisted), true);
+  });
+
+  it('shows where a transcript is, relative to the projects root, and says when there is none', () => {
+    assert.equal(describeTranscript(world.paths, listedA), path.join(encodeCwd(t1.cwd), `${t1.cliId}.jsonl`));
+    assert.equal(describeTranscript(world.paths, bare), '(no transcript)');
   });
 });

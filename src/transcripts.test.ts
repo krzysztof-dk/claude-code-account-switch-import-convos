@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import {
@@ -13,21 +13,25 @@ import {
   readLines,
   readTree,
   replaceInBytes,
+  writeSessionKeyedDirs,
   writeSshTranscript,
   writeTranscript,
   type World,
 } from '../test/fixtures.ts';
 import {
+  SESSION_KEYED_DIRS,
   SessionIdRewriter,
   appendBridgeTombstones,
   bridgeTombstone,
   copyRewritingSessionId,
+  copySessionKeyedDir,
   copySidecar,
   extractEmail,
   isSshMirror,
   listTranscripts,
   liveBridges,
   locateTranscript,
+  sessionKeyedDirs,
   sshMirrorDir,
   summarizeTranscript,
 } from './transcripts.ts';
@@ -242,5 +246,75 @@ describe('transcripts', () => {
     const copied = await readTree(sidecar);
     assert.ok([...copied.keys()].every((name) => !name.includes('.cc-writes')), [...copied.keys()].join(', '));
     assert.ok(copied.has(path.join('tool-results', 'result1.txt')));
+  });
+});
+
+describe('transcripts: the directories the CLI keeps per session', () => {
+  let world: World;
+  before(async () => {
+    world = await makeWorld();
+  });
+  after(async () => {
+    await destroyWorld(world);
+  });
+
+  it('finds only the per-session directories that exist, in SESSION_KEYED_DIRS order', async () => {
+    const claudeDir = world.paths.claudeDir;
+    const id = '12121212-1212-4121-8121-121212121212';
+    assert.deepEqual(await sessionKeyedDirs(claudeDir, id), [], 'a session without any');
+    // image-cache is made first, yet listed last: the order is the list's, not the disk's.
+    await mkdir(path.join(claudeDir, 'image-cache', id), { recursive: true });
+    await writeSessionKeyedDirs(claudeDir, id);
+    assert.deepEqual(await sessionKeyedDirs(claudeDir, id), [
+      { name: 'file-history', path: path.join(claudeDir, 'file-history', id) },
+      { name: 'uploads', path: path.join(claudeDir, 'uploads', id) },
+      { name: 'image-cache', path: path.join(claudeDir, 'image-cache', id) },
+    ]);
+    assert.deepEqual(SESSION_KEYED_DIRS, ['file-history', 'uploads', 'image-cache']);
+    // Another session's directories are not this one's.
+    assert.deepEqual(await sessionKeyedDirs(claudeDir, '34343434-3434-4343-8343-343434343434'), []);
+  });
+
+  it('does not count a file where a per-session directory is expected', async () => {
+    const claudeDir = world.paths.claudeDir;
+    const id = '56565656-5656-4565-8565-565656565656';
+    await mkdir(path.join(claudeDir, 'file-history', id), { recursive: true });
+    await mkdir(path.join(claudeDir, 'uploads'), { recursive: true });
+    await writeFile(path.join(claudeDir, 'uploads', id), 'a file, not a directory');
+    assert.deepEqual(await sessionKeyedDirs(claudeDir, id), [{ name: 'file-history', path: path.join(claudeDir, 'file-history', id) }]);
+  });
+
+  it('copies a per-session directory as it is, permission bits included, and leaves the source', async () => {
+    const claudeDir = world.paths.claudeDir;
+    const id = '78787878-7878-4787-8787-787878787878';
+    const copy = '90909090-9090-4909-8909-909090909090';
+    await writeSessionKeyedDirs(claudeDir, id);
+    const source = path.join(claudeDir, 'file-history', id);
+    await chmod(path.join(source, '6d282dbb5ee2b832@v1'), 0o640);
+    await chmod(path.join(source, '6d282dbb5ee2b832@v2'), 0o600);
+    await mkdir(path.join(source, 'nested'), { recursive: true });
+    await writeFile(path.join(source, 'nested', 'deep'), Buffer.from([0, 1, 2, 255]), { mode: 0o644 });
+    const before = await readTree(source);
+    const destination = path.join(claudeDir, 'file-history', copy);
+    await copySessionKeyedDir(source, destination);
+    assert.deepEqual(await readTree(destination), before, 'same names, bytes and permission bits');
+    assert.equal((await readTree(destination)).get('6d282dbb5ee2b832@v1')?.mode, 0o640);
+    assert.deepEqual(await readTree(source), before, 'the source stays');
+  });
+
+  it('refuses a destination that exists already instead of merging two sessions', async () => {
+    const claudeDir = world.paths.claudeDir;
+    const id = 'abababab-abab-4bab-8bab-abababababab';
+    await writeSessionKeyedDirs(claudeDir, id);
+    const source = path.join(claudeDir, 'uploads', id);
+    const taken = path.join(claudeDir, 'uploads', 'cdcdcdcd-cdcd-4cdc-8cdc-cdcdcdcdcdcd');
+    await mkdir(taken, { recursive: true });
+    await writeFile(path.join(taken, 'other-session.png'), 'not ours');
+    await assert.rejects(() => copySessionKeyedDir(source, taken), (error: unknown) => (error as NodeJS.ErrnoException).code === 'ERR_FS_CP_EEXIST');
+    assert.deepEqual([...(await readTree(taken)).keys()], ['other-session.png'], 'nothing was merged in');
+    // A destination taken by the very same files is refused too.
+    const fresh = path.join(claudeDir, 'uploads', 'efefefef-efef-4fef-8fef-efefefefefef');
+    await copySessionKeyedDir(source, fresh);
+    await assert.rejects(() => copySessionKeyedDir(source, fresh));
   });
 });

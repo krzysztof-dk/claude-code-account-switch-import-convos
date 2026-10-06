@@ -5,6 +5,7 @@ import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import {
   APP_PROCESS_NAME,
+  GuardRefusal,
   CLI_ARGV_PATTERN,
   CLI_PROCESS_NAME,
   detectClaudeCli,
@@ -192,5 +193,18 @@ describe('app guard', () => {
     if (found.status === 'unknown') return t.skip(`pgrep cannot list processes here: ${found.error ?? 'no reason given'}`);
     assert.equal(found.status, 'not-running');
     assert.deepEqual(found.processes, []);
+  });
+});
+
+describe('GuardRefusal', () => {
+  it('carries the reason of the closed gate as its message, under its own name', () => {
+    const refusal = new GuardRefusal('Claude Code is running: Claude (PID 1)');
+    assert.ok(refusal instanceof Error);
+    assert.equal(refusal.name, 'GuardRefusal');
+    assert.equal(refusal.message, 'Claude Code is running: Claude (PID 1)');
+  });
+
+  it('falls back to a general message when the gate gave no reason', () => {
+    assert.equal(new GuardRefusal(null).message, 'writes are not allowed');
   });
 });
