@@ -83,7 +83,7 @@ function describeEnvironment(context: TuiContext): string {
 export async function runTui(session: TuiSession, options: TuiOptions = {}): Promise<number> {
   const dryRun = options.dryRun === true;
   p.intro(`${pc.bgCyan(pc.black(' ccas '))} Claude Code conversations between accounts${dryRun ? pc.yellow('  (dry run)') : ''}`);
-  const processes = await detectClaudeProcesses();
+  const processes = await detectClaudeProcesses(session.paths.claudeDir);
   const base = { ...session, processes, guard: makeGuard(session.paths), dryRun };
   const context: TuiContext = {
     ...base,

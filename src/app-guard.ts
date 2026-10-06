@@ -31,10 +31,28 @@
 //     "2.1.281", not "claude"; on the Mac mini on 2026-09-28 the name match
 //     found none of the twenty-odd ccd-cli processes of the SSH sessions. The
 //     first argument (how the process was started) still shows what it is.
+//   - by the npm-installed CLI's command line, "node .../node_modules/
+//     @anthropic-ai/claude-code/cli.js": that process is named "node", so
+//     only its first two arguments tell it apart (added 2026-10-05; before
+//     that the README listed it as undetected).
+//   - from the CLI's own session index, <claudeDir>/sessions/<pid>.json. The
+//     CLI writes one file per running session (pid, procStart, sessionId,
+//     cwd, status, version, entrypoint; seen with CLI 2.1.286, the build the
+//     desktop app bundles, on 2026-10-05) and removes it on exit; files of
+//     sessions that crashed stay until the next launch clears them (code.
+//     claude.com, "Claude directory"), so a file alone proves nothing and
+//     the pid is checked for life with signal 0. EPERM counts as alive: the
+//     process exists under another user, or the sandbox hides it, and not
+//     knowing is not permission. This finds CLI processes whatever their
+//     binary is called. A pid that an unrelated process reused after a
+//     crash counts as running until the next CLI launch clears the file;
+//     the refusal names the session file so the person can tell.
 // When pgrep cannot list processes at all (inside the Claude Code sandbox it
 // fails with "Cannot get process list"), the status is "unknown" and writes
 // into the live directory are refused as well: not knowing is not permission.
 import { execFile } from 'node:child_process';
+import { readdir, readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { promisify } from 'node:util';
 import type { Paths } from './paths.ts';
 
@@ -69,6 +87,10 @@ const CLI_FIRST_ARGUMENTS = [
   // The CLI the desktop app bundles, whose path has a space in it
   // ("Application Support"); its process name "claude" finds it as well.
   '.*/claude\\.app/Contents/MacOS/claude',
+  // The CLI installed with npm, which runs as "node <global node_modules>/
+  // @anthropic-ai/claude-code/cli.js": two arguments, since the first one is
+  // any node binary. Other cli.js files under other names stay out.
+  '[^ ]*node [^ ]*/@anthropic-ai/claude-code/cli\\.js',
 ];
 
 /**
@@ -106,12 +128,16 @@ export interface ProcessDetection {
   error?: string | undefined;
 }
 
-interface PgrepResult {
+/** What one pgrep run found; tests build these by hand to stand in for pgrep. */
+export interface PgrepResult {
   status: AppStatus;
   /** Non-empty output lines: a pid each, followed by the argument list with -l -f. */
   lines: string[];
   error?: string | undefined;
 }
+
+/** Runs pgrep with the given arguments (see pgrepArgs, pgrepArgvArgs); tests pass a stand-in. */
+export type PgrepRunner = (args: readonly string[]) => Promise<PgrepResult>;
 
 async function runPgrep(args: readonly string[]): Promise<PgrepResult> {
   try {
@@ -129,8 +155,8 @@ async function runPgrep(args: readonly string[]): Promise<PgrepResult> {
 }
 
 /** Processes named exactly `name`, the tool's own ancestors included. */
-export async function detectProcess(name: string): Promise<ProcessDetection> {
-  const result = await runPgrep(pgrepArgs(name));
+export async function detectProcess(name: string, pgrep: PgrepRunner = runPgrep): Promise<ProcessDetection> {
+  const result = await pgrep(pgrepArgs(name));
   const processes = result.lines
     .map((line) => Number(line))
     .filter((pid) => Number.isInteger(pid) && pid > 0)
@@ -139,13 +165,84 @@ export async function detectProcess(name: string): Promise<ProcessDetection> {
 }
 
 /**
- * Every Claude Code CLI process: found by name, and by first argument for
- * binaries named after their version. The two lists are merged by pid. Only
- * the first argument is kept for messages, never the rest of the command
- * line, which may hold a prompt.
+ * Whether a process with this pid exists: signal 0 is delivered to nothing,
+ * but fails with ESRCH when there is no such process. EPERM means the
+ * process exists under another user, or that the sandbox refuses to tell;
+ * both count as alive, because not knowing is not permission to write.
  */
-export async function detectClaudeCli(): Promise<ProcessDetection> {
-  const [byName, byArgv] = await Promise.all([detectProcess(CLI_PROCESS_NAME), runPgrep(pgrepArgvArgs(CLI_ARGV_PATTERN))]);
+export function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/** The name of the CLI's session index directory under its config directory. */
+export const SESSIONS_DIR_NAME = 'sessions';
+
+/**
+ * CLI sessions according to the CLI's own index: <claudeDir>/sessions holds
+ * one <pid>.json per running session, with the pid, the session id and the
+ * folder (see the header). A file whose pid is dead is a leftover of a
+ * crashed session and is skipped; a torn file (a session dying while
+ * writing it) or one without a usable pid is skipped too. A missing
+ * directory means no session ever ran with this CLI; an unreadable one
+ * means "unknown", like a pgrep that cannot list processes.
+ */
+export async function detectCliSessionFiles(sessionsDir: string, isAlive: (pid: number) => boolean = processAlive): Promise<ProcessDetection> {
+  let names: string[];
+  try {
+    names = await readdir(sessionsDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { label: CLI_PROCESS_NAME, status: 'not-running', processes: [] };
+    return { label: CLI_PROCESS_NAME, status: 'unknown', processes: [], error: `${sessionsDir}: ${(error as Error).message}` };
+  }
+  const processes: ProcessMatch[] = [];
+  for (const name of names.filter((candidate) => /^\d+\.json$/.test(candidate)).sort()) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(path.join(sessionsDir, name), 'utf8'));
+    } catch {
+      continue;
+    }
+    const entry = parsed !== null && typeof parsed === 'object' ? (parsed as { pid?: unknown; sessionId?: unknown; cwd?: unknown }) : {};
+    const pid = typeof entry.pid === 'number' ? entry.pid : Number(name.slice(0, -'.json'.length));
+    if (!Number.isInteger(pid) || pid <= 0 || !isAlive(pid)) continue;
+    const session = typeof entry.sessionId === 'string' ? `session ${entry.sessionId.slice(0, 8)}` : 'a session';
+    const where = typeof entry.cwd === 'string' ? ` in ${entry.cwd}` : '';
+    processes.push({ pid, command: `${session}${where}, from its session file ${name}` });
+  }
+  return { label: CLI_PROCESS_NAME, status: processes.length > 0 ? 'running' : 'not-running', processes };
+}
+
+/** How the CLI is looked for; tests replace the parts that need a real process list. */
+export interface DetectOptions {
+  /** Runs pgrep; tests pass a stand-in, since pgrep cannot list processes inside the Claude Code sandbox. */
+  pgrep?: PgrepRunner | undefined;
+  /** The CLI's session index (<claudeDir>/sessions); null or undefined leaves the session files out. */
+  sessionsDir?: string | null | undefined;
+  /** Tells whether a process with that pid exists (processAlive); tests pass a stand-in. */
+  isAlive?: ((pid: number) => boolean) | undefined;
+}
+
+/**
+ * Every Claude Code CLI process: found by name, by first argument for
+ * binaries named after their version (and by the first two for the npm
+ * install), and through the CLI's own session index. The lists are merged
+ * by pid. Only the first argument is kept for messages, never the rest of
+ * the command line, which may hold a prompt. A process found anywhere
+ * means "running", even when another source could not tell; "unknown" only
+ * when nothing was found and some source failed.
+ */
+export async function detectClaudeCli(options: DetectOptions = {}): Promise<ProcessDetection> {
+  const pgrep = options.pgrep ?? runPgrep;
+  const [byName, byArgv, bySession] = await Promise.all([
+    detectProcess(CLI_PROCESS_NAME, pgrep),
+    pgrep(pgrepArgvArgs(CLI_ARGV_PATTERN)),
+    options.sessionsDir ? detectCliSessionFiles(options.sessionsDir, options.isAlive) : Promise.resolve(null),
+  ]);
   const found = new Map<number, ProcessMatch>();
   for (const match of byName.processes) found.set(match.pid, match);
   for (const line of byArgv.lines) {
@@ -154,18 +251,28 @@ export async function detectClaudeCli(): Promise<ProcessDetection> {
     const pid = Number(parsed[1]);
     if (!found.has(pid)) found.set(pid, { pid, command: parsed[2] ?? CLI_PROCESS_NAME });
   }
+  for (const match of bySession?.processes ?? []) if (!found.has(match.pid)) found.set(match.pid, match);
   const processes = [...found.values()].sort((a, b) => a.pid - b.pid);
   if (processes.length > 0) return { label: CLI_PROCESS_NAME, status: 'running', processes };
-  const failures = [byName.error, byArgv.error].filter((error): error is string => typeof error === 'string');
-  if (byName.status === 'unknown' || byArgv.status === 'unknown') {
+  const sources = [byName, byArgv, ...(bySession ? [bySession] : [])];
+  const failures = sources.map((source) => source.error).filter((error): error is string => typeof error === 'string');
+  if (sources.some((source) => source.status === 'unknown')) {
     return { label: CLI_PROCESS_NAME, status: 'unknown', processes: [], error: failures.join('; ') || 'pgrep failed' };
   }
   return { label: CLI_PROCESS_NAME, status: 'not-running', processes: [] };
 }
 
-/** The desktop app and the CLI, in that order. */
-export async function detectClaudeProcesses(): Promise<ProcessDetection[]> {
-  return Promise.all([detectProcess(APP_PROCESS_NAME), detectClaudeCli()]);
+/**
+ * The desktop app and the CLI, in that order. With the CLI's config
+ * directory the session index there is read as well (see detectClaudeCli);
+ * without it only the process list counts, which is what the README's
+ * one-line check uses.
+ */
+export async function detectClaudeProcesses(claudeDir?: string, options: Omit<DetectOptions, 'sessionsDir'> = {}): Promise<ProcessDetection[]> {
+  return Promise.all([
+    detectProcess(APP_PROCESS_NAME, options.pgrep),
+    detectClaudeCli({ ...options, sessionsDir: claudeDir ? path.join(claudeDir, SESSIONS_DIR_NAME) : null }),
+  ]);
 }
 
 export interface WriteGate {
@@ -210,7 +317,7 @@ export function writeGate(paths: Paths, detections: readonly ProcessDetection[])
 export type Guard = () => Promise<WriteGate>;
 
 export function makeGuard(paths: Paths): Guard {
-  return async () => (paths.liveUserData ? writeGate(paths, await detectClaudeProcesses()) : { allowed: true, reason: null });
+  return async () => (paths.liveUserData ? writeGate(paths, await detectClaudeProcesses(paths.claudeDir)) : { allowed: true, reason: null });
 }
 
 /** Thrown when the guard closes in the middle of an operation; the operation rolls itself back. */

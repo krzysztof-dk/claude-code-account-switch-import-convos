@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { writeFile } from 'node:fs/promises';
+import { appendFile, writeFile } from 'node:fs/promises';
 import { after, before, describe, it } from 'node:test';
 import {
   ACCOUNT_A,
@@ -8,6 +8,7 @@ import {
   EMAIL_A,
   EMAIL_B,
   appendRounds,
+  buildTranscriptLines,
   destroyWorld,
   makeWorld,
   readJson,
@@ -188,5 +189,56 @@ describe('inventory', () => {
     assert.equal(assessment.state, 'ambiguous');
     assert.equal(assessment.existing, null);
     assert.match(assessment.warnings[0] ?? '', new RegExp(lookalike.record.record.sessionId));
+  });
+
+  it('reports record fields no list in records.ts knows, once per account', async () => {
+    // A field the app 2.19675.0 serializer does not write stands for one a
+    // newer app version added; the report is what makes the next review
+    // classify it instead of copies carrying it unnoticed.
+    await writeRecord(world, world.b, { cliSessionId: '88888888-8888-4888-8888-888888888888', title: 'R-new-field', brandNewField: { nested: true }, anotherOne: 1 });
+    await writeRecord(world, world.b, { cliSessionId: '87878787-8787-4878-8787-878787878787', title: 'R-new-field-2', brandNewField: 'x' });
+    await rebuild();
+    const reports = inventory.problems.filter((problem) => problem.includes('does not know'));
+    assert.equal(reports.length, 1, 'one report for account B');
+    assert.match(reports[0] ?? '', /anotherOne \(1\), brandNewField \(2\)/);
+    assert.match(reports[0] ?? '', new RegExp(ACCOUNT_B.accountId.slice(0, 8)));
+    // Known fields, source-bound ones included, are never reported.
+    assert.ok(!reports[0]?.includes('cliSessionId') && !reports[0]?.includes('title'));
+  });
+
+  it('cuts the e-mail votes of a moved record at the line count the move link recorded', async () => {
+    // A moved record keeps its transcript (with the source account's
+    // session_context lines) and the move writes a link with the line count
+    // of that moment; only sightings past it count for the new account. A
+    // world of its own, so no other conversation of account B votes.
+    const own = await makeWorld();
+    try {
+      const t = await writeTranscript(own, { prompts: 1, email: EMAIL_A, title: 'T-moved' });
+      const { record } = await writeRecord(own, own.b, { cliSessionId: t.cliId, title: 'R-moved' });
+      const lineage = await LineageStore.load(own.paths.dataDir);
+      const build = async (): Promise<Inventory> => buildInventory(own.paths, { store: await AccountStore.load(own.paths.dataDir), lineage });
+      const emailOf = (built: Inventory): string | null => built.accounts.find((account) => account.accountId === ACCOUNT_B.accountId)?.email ?? null;
+      // The link is written before any inventory sees the moved record, as a
+      // move does; an inventory built without it would remember the source
+      // account's e-mail for B in accounts.json, and that memory is a
+      // deliberate fallback when nothing else votes.
+      await lineage.add({
+        rootUuid: t.uuids[0]!,
+        at: Date.UTC(2026, 9, 5),
+        journalId: 'test-move',
+        mode: 'move',
+        action: 'moved',
+        sourceLineCount: t.lines.length,
+        source: { ...ACCOUNT_A, sessionId: record.sessionId, cliSessionId: t.cliId },
+        target: { ...ACCOUNT_B, sessionId: record.sessionId, cliSessionId: t.cliId },
+      });
+      assert.equal(emailOf(await build()), null, 'with the link the source account e-mail does not vote for B');
+      // Once the target account continues the conversation, its own line counts.
+      const continued = buildTranscriptLines({ cliId: t.cliId, prompts: 0, email: EMAIL_B }).lines.filter((line) => line['type'] === 'attachment');
+      await appendFile(t.path, continued.map((line) => JSON.stringify(line)).join('\n') + '\n');
+      assert.equal(emailOf(await build()), EMAIL_B);
+    } finally {
+      await destroyWorld(own);
+    }
   });
 });

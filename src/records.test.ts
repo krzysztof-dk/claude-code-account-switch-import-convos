@@ -4,6 +4,7 @@ import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { destroyWorld, makeWorld, writeRecord as writeFixtureRecord, type World } from '../test/fixtures.ts';
 import {
+  KNOWN_RECORD_FIELDS,
   REMOTE_CONTROL_FIELDS,
   SOURCE_BOUND_FIELDS,
   effectiveCliSessionId,
@@ -15,11 +16,50 @@ import {
   parseRecord,
   readRecords,
   transcriptRefs,
+  unknownFields,
   withRemoteControlOff,
   withoutSourceBoundFields,
   writeRecord,
   type SessionRecord,
 } from './records.ts';
+
+/**
+ * The top-level keys of the record serializer in Claude.app 2.19675.0, read
+ * from app.asar on 2026-10-05 (the object literal that starts with
+ * sessionId and cliSessionId; 161 keys). When a newer app version adds a
+ * field, add it here and sort it into SOURCE_BOUND_FIELDS or
+ * KNOWN_RECORD_FIELDS; the test below names what is missing.
+ */
+const SERIALIZER_FIELDS_2_19675 = `
+  sessionId cliSessionId cwd originCwd worktreePath worktreeName worktreeLazy worktreePinned gitAnchors
+  gitAnchorsLookupOnly gitAnchorsFolderRealpath lastFocusedAt sourceBranch branch pendingSystemReminder
+  pendingFirstStart createdAt lastActivityAt model effort effortInherited sessionSettings agent isArchived
+  title titleSource previousTitles permissionMode enabledMcpTools remoteMcpServersConfig withheldConnectorHosts
+  sshConfig wslConfig sshRemoteProcessId sshReattach sshRemoteTranscriptPath sessionPermissionUpdates
+  alwaysAllowedReasons prs writtenBranches autoArchiveExempt autoArchiveOnPrClose isStarred movedToCloud
+  keptDirtyWorktree keptDirtyAt keptWorktreeLeftover seenCommentIds autoFixDelivered chromePermissionMode
+  chromeAllowedDomains chromeTabGroupId cuAllowedApps cuGrantFlags cuFlagsGrantedAt cuLastScreenshotDims
+  cuSelectedDisplayId recap recapAt scheduledTaskId spaceId contextExceededCount completedTurns titleTurn
+  titleCheck titleOffers titleSuggestionsOff transcriptUnavailable subagentsTruncatedFor error errorCategory
+  tccFolderKind errorAt postTurnSummary postTurnSummaryFor lastAssistantUuid turnWrapUp priorErrorMark
+  interruptedByQuitAt interruptedUnseenResume sshProcessLossStoodDownAt sshKillRecoveryGrantedAt
+  sshForeignDaemonLossAt lastSpawnRootDetected bypassChosenInApp autoChosenInApp _startedThroughHostCliLauncher
+  launcherAtSpawn ranInSandboxVm armedWorkAtQuit queryCrashes publishedArtifacts scratchPromptRecents
+  scratchOfferFolder scratchFilesLeftIn scratchCarried dispatchParentId dispatchParentOrigin forkedFromSessionId
+  forkedAtMessageUuid lineageDetached titleFromPr priorCliSessionIds rewindEdges transcriptModelStates
+  transcriptCuts importedFrom indexedAt resumeConfirmed stagedTranscriptPath spawnedFrom spawnedFromEndNotified
+  lastTurnReport sideSessionReportOwed sideSessionNotes queuedSideSessionNotes backgroundTaskSuggestions
+  peerReceipts peerInbound resolvedBackgroundTaskSuggestions cloudSpawnedTasks emailAddress envScopeId
+  startedFromEnvironmentId bridgeSessionIds cloudSessionId remoteControlSpawn remoteControlDescendant
+  remoteControlAutoEligible remoteControlUserEnabled scheduledRunContinued steeredByRemoteClient
+  sideSessionStartsSinceUserMessage latestUserFrameAt color classifierSummaryEnabled reportFindingsCard
+  turnBoxDeclared sideSessionOffersMuted setupTools midTaskReplyTool conversationPluginLoaded asides
+  turnBoxMounted violinBowPrompts violinBowPromptKinds lanyardOfferPrompt autoModeServerFallbackPrompt violinBow
+  violinBowHomeSettings spawnSeed cliBinaryPin promptAppendSnapshot toolSurfaceSnapshot adoptedFromOtherSurface
+  surfaceNoticeUuid autoFixNoticeSent devIntents devIntentTriggers cliMcpAppServerNames terminalClaudeTabOrdinal
+`
+  .split(/\s+/)
+  .filter((field) => field.length > 0);
 
 describe('records', () => {
   let world: World;
@@ -153,6 +193,43 @@ describe('records', () => {
     for (const field of Object.keys(identity)) assert.ok(!(field in stripped), `${field} must not reach the copy`);
     assert.equal(stripped.title, 'kept');
     assert.equal(stripped['effort'], 'high');
+  });
+
+  it('classifies every record field the app 2.19675.0 serializer writes', () => {
+    assert.equal(SERIALIZER_FIELDS_2_19675.length, 161);
+    const classified = new Set<string>([...SOURCE_BOUND_FIELDS, ...REMOTE_CONTROL_FIELDS, ...KNOWN_RECORD_FIELDS]);
+    assert.deepEqual(
+      SERIALIZER_FIELDS_2_19675.filter((field) => !classified.has(field)),
+      [],
+      'fields the 2.19675.0 serializer writes that no list in records.ts classifies',
+    );
+    // A field is either dropped from a copy or kept, never both: the kept list
+    // shares nothing with the two dropped ones (which overlap on purpose, the
+    // claude.ai session fields being both source-bound and Remote Control).
+    const dropped = new Set<string>([...SOURCE_BOUND_FIELDS, ...REMOTE_CONTROL_FIELDS]);
+    assert.deepEqual(
+      KNOWN_RECORD_FIELDS.filter((field) => dropped.has(field)),
+      [],
+      'fields listed as kept and as dropped',
+    );
+  });
+
+  it('names the fields of a record that no list knows', () => {
+    const record = parseRecord(
+      JSON.stringify({
+        sessionId: 'local_a',
+        createdAt: 1,
+        lastActivityAt: 2,
+        title: 't',
+        emailAddress: 'alpha@example.com',
+        ccas: { copiedFrom: { cliSessionId: 'x' }, rootUuid: null, sourceLineCount: 0, at: 0 },
+        brandNewField: 1,
+        anotherOne: 'x',
+      }),
+    );
+    assert.ok(record);
+    assert.deepEqual(unknownFields(record), ['anotherOne', 'brandNewField']);
+    assert.deepEqual(unknownFields({ sessionId: 'local_b', createdAt: 1, lastActivityAt: 2 }), []);
   });
 
   it('switches Remote Control off the way the app records a conversation started without it', () => {

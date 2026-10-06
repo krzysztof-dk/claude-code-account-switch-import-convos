@@ -311,13 +311,19 @@ async function runAccounts(session: Session, io: Io, json: boolean): Promise<num
   }
   io.out(`${renderTable([ACCOUNT_HEADER, ...inventory.accounts.map(accountRow)])}\n`);
   io.out(`unlisted transcripts (no record on any account): ${inventory.unlisted.length}\n`);
-  for (const problem of inventory.problems) io.err(`warning: ${problem}\n`);
+  warnProblems(inventory, io);
   return EXIT_OK;
+}
+
+/** Problems the inventory found (unreadable records, fields this tool does not know), as warnings on stderr. */
+function warnProblems(inventory: Inventory, io: Io): void {
+  for (const problem of inventory.problems) io.err(`warning: ${problem}\n`);
 }
 
 async function runList(session: Session, io: Io, from: string, to: string | undefined, json: boolean): Promise<number> {
   const inventory = await inventoryOf(session);
   await warnInterrupted(session, io);
+  warnProblems(inventory, io);
   const source = accountOrNone(inventory, from);
   const target = to === undefined ? null : matchAccount(inventory.accounts, to);
   const conversations = conversationsOf(inventory, source);
@@ -351,6 +357,8 @@ interface TransferOptions {
 interface TransferPlan {
   items: TransferItem[];
   excluded: Conversation[];
+  /** What the inventory found wrong or unknown while reading (printed as warnings before the plan). */
+  problems: string[];
 }
 
 /**
@@ -368,7 +376,7 @@ async function planTransfer(session: Session, options: TransferOptions): Promise
   const chosen = options.all
     ? pool.filter((conversation) => !excluded.includes(conversation))
     : [...new Set(options.sessions.map((selector) => findConversation(pool, selector)))];
-  return { excluded, items: planTransfers(inventory, source, target, chosen, options.mode, options.onConflict) };
+  return { excluded, items: planTransfers(inventory, source, target, chosen, options.mode, options.onConflict), problems: inventory.problems };
 }
 
 async function runTransfer(session: Session, io: Io, options: TransferOptions): Promise<number> {
@@ -389,6 +397,7 @@ async function runTransfer(session: Session, io: Io, options: TransferOptions): 
   }
 
   const prefix = options.dryRun ? '[dry-run] ' : '';
+  for (const problem of plan.problems) io.err(`warning: ${problem}\n`);
   for (const conversation of plan.excluded) io.out(`${prefix}excluded "${truncate(conversation.title, 60)}" (${conversationId(conversation)})\n`);
   const context = { paths: session.paths, journal: session.journal, lineage: session.lineage, dryRun: options.dryRun };
   const tally = new Map<OutcomeAction, number>();

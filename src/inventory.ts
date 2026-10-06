@@ -35,7 +35,7 @@ import {
 } from './accounts.ts';
 import { compareChains, consistencyWarnings, type ChainComparison } from './compare.ts';
 import type { Paths } from './paths.ts';
-import { effectiveCliSessionId, readRecords, transcriptRefs, type LoadedRecord } from './records.ts';
+import { effectiveCliSessionId, readRecords, transcriptRefs, unknownFields, type LoadedRecord } from './records.ts';
 import type { LineageEndpoint, LineageLink, LineageStore } from './lineage.ts';
 import type { SummaryCache } from './summary-cache.ts';
 import { listTranscripts, summarizeTranscript, type TranscriptLocation, type TranscriptSummary } from './transcripts.ts';
@@ -283,6 +283,24 @@ export async function buildInventory(paths: Paths, options: BuildOptions): Promi
     const key = accountKey(dir.accountId, dir.orgId);
     const { records, problems: recordProblems } = await readRecords(dir.dir);
     problems.push(...recordProblems);
+    // The audit of record fields (records.ts, unknownFields): a field no list
+    // classifies is most likely new in the installed app version, and copies
+    // carry it verbatim until it is sorted into the lists. Reported once per
+    // account, with how many records carry each field.
+    const unknown = new Map<string, number>();
+    for (const loaded of records) {
+      for (const field of unknownFields(loaded.record)) unknown.set(field, (unknown.get(field) ?? 0) + 1);
+    }
+    if (unknown.size > 0) {
+      const fields = [...unknown]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([field, count]) => `${field} (${count})`)
+        .join(', ');
+      problems.push(
+        `records of account ${dir.accountId.slice(0, 8)}... carry fields this tool does not know: ${fields}; ` +
+          'a newer app version probably added them, and copies carry them as they are until records.ts classifies them',
+      );
+    }
     const conversations: Conversation[] = [];
     for (const loaded of records) {
       for (const ref of transcriptRefs(loaded.record)) referenced.add(ref);
