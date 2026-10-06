@@ -22,7 +22,22 @@ import { appendFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { after, afterEach, before, describe, it } from 'node:test';
 import { promisify } from 'node:util';
-import { EMAIL_A, FAKE_SSH, destroyWorld, hostHome, makeWorld, readJson, writeRecord, writeTranscript, type World } from '../../test/fixtures.ts';
+import {
+  EMAIL_A,
+  FAKE_SSH,
+  appendRounds,
+  destroyWorld,
+  encodeCwd,
+  hostHome,
+  makeWorld,
+  readJson,
+  readLines,
+  sshRecordFields,
+  writeRecord,
+  writeSshTranscript,
+  writeTranscript,
+  type World,
+} from '../../test/fixtures.ts';
 import { pathExists } from '../fsx.ts';
 import { LOCK_FILE_NAME } from '../lock.ts';
 import { packageRoot } from '../paths.ts';
@@ -316,8 +331,15 @@ describe('tui through a pipe', { concurrency: false }, () => {
       await writeFile(second, 'half-written too');
       await appendFile(journal, `${JSON.stringify(cutShortEntry('20261006T090100Z-bbbbbb', second))}\n`);
       const exit = (tui = new Tui(own));
-      // Exit is the last of Undo, Leave, Exit.
+      // Exit is the last of Undo, Leave, Exit. It is confirmed after a note
+      // that says what stays interrupted; No there asks the question again.
       await exit.answer('What should happen to it?', KEY.up + KEY.enter);
+      await exit.waitFor('Undone so far: nothing.');
+      await exit.waitFor('Still interrupted, asked about again before the next write');
+      assert.ok(exit.flat().includes('20261006T090100Z-bbbbbb: copy "cut short"'), exit.flat());
+      await exit.answer('Exit now?', 'n');
+      await exit.answer('What should happen to it?', KEY.up + KEY.enter);
+      await exit.answer('Exit now?', 'y');
       await exit.waitFor('Nothing more was changed.');
       assert.equal(await exit.finish(), 4);
       assert.ok(await pathExists(second), 'Exit changes nothing');
@@ -367,5 +389,199 @@ describe('tui through a pipe', { concurrency: false }, () => {
     assert.deepEqual(await localRecords(world.b.dir), [], 'the refused transfer wrote nothing');
     await t.quit(true);
     assert.equal(await pathExists(lock), false, 'released when the TUI ended');
+  });
+
+  /** Appends one round to the transcript of every copy on B, so each pair reads "target is newer" on the next transfer. */
+  async function growCopiesOnB(startAt: number): Promise<void> {
+    for (const name of await localRecords(world.b.dir)) {
+      const record = await readJson<{ cliSessionId?: string; cwd: string }>(path.join(world.b.dir, name));
+      assert.ok(record.cliSessionId, `${name} names its transcript`);
+      const projectDir = path.join(world.paths.projectsRoot, encodeCwd(record.cwd));
+      const transcript = { cliId: record.cliSessionId, path: path.join(projectDir, `${record.cliSessionId}.jsonl`), projectDir, sidecarDir: '', cwd: record.cwd, lines: [], uuids: [] };
+      await appendRounds(transcript, 1, startAt);
+    }
+  }
+
+  /** Walks the transfer screen up to the first conflict question: source A, target B, all conversations, Copy. */
+  async function reachConflictQuestion(t: Tui): Promise<void> {
+    await t.answer('What next?', KEY.enter);
+    await t.answer('Source', KEY.enter);
+    await t.answer('Target account', KEY.enter);
+    await t.answer('Which conversations to transfer to', KEY.enter);
+    assert.ok(t.recent().includes('2 target is newer'), t.recent());
+    await t.answer('Copy (sync)', KEY.enter);
+    await t.waitFor('What to do?');
+  }
+
+  it('(i) answers one conflict question for every conflict left, after a note and a confirmation', { timeout: 30_000 }, async () => {
+    const copied = await runCli(world, 'transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--mode', 'copy', '--all');
+    assert.equal(copied.code, 0, copied.stderr);
+    await growCopiesOnB(Date.UTC(2026, 8, 5));
+    const t = open();
+    await reachConflictQuestion(t);
+    // Skip, Overwrite, Skip all, Overwrite all, Cancel: the fourth.
+    t.child.stdin.write(KEY.down + KEY.down + KEY.down + KEY.enter);
+    await t.waitFor('Overwritten: each target copy is replaced by the source.');
+    assert.equal(t.flat().split('(target is newer: target has 4 extra lines)').length - 1, 2, `the note lists both:\n${t.flat()}`);
+    await t.answer('Overwrite the target copies of all 2 remaining conflicts?', 'y');
+    await t.waitFor('Plan');
+    const asked = ['first chat', 'second chat'].filter((title) => t.output().includes(`"${title}": target is newer`));
+    assert.equal(asked.length, 1, `only the first conflict was asked about: ${asked.join(', ')}`);
+    assert.equal(t.output().split('[dry-run] updated "').length - 1, 2, t.output());
+    await t.answer('Apply 2 operations?', 'y');
+    await t.waitFor('Result');
+    const result = t.flat().slice(t.flat().lastIndexOf('Result'));
+    for (const title of ['first chat', 'second chat']) assert.match(result, new RegExp(`updated "${title}" on bbbbbbbb`), result);
+    await t.quit();
+  });
+
+  it('(j) declines a batch answer, then cancels the transfer after the note, with nothing written', { timeout: 30_000 }, async () => {
+    await growCopiesOnB(Date.UTC(2026, 8, 7));
+    const journal = path.join(world.paths.dataDir, 'journal.jsonl');
+    const entriesBefore = (await readLines(journal)).length;
+    const t = open();
+    await reachConflictQuestion(t);
+    // Skip all (the third answer), declined at its confirmation.
+    t.child.stdin.write(KEY.down + KEY.down + KEY.enter);
+    await t.waitFor('Skipped: the target copy of each stays as it is');
+    await t.answer('Skip all 2 remaining conflicts?', 'n');
+    // The same question again; Cancel is the last answer.
+    await t.answer('What to do?', KEY.up + KEY.enter);
+    await t.waitFor('Nothing has been written: these questions come before the plan');
+    await t.answer('Cancel the transfer?', 'y');
+    await t.waitFor('Transfer cancelled: nothing was changed.');
+    await t.quit();
+    assert.equal((await readLines(journal)).length, entriesBefore, 'no operation ran');
+  });
+
+  describe('(k) a conversation fails during the run', { concurrency: false }, () => {
+    let own: World;
+    const openOwn = (): Tui => (tui = new Tui(own));
+
+    before(async () => {
+      own = await makeWorld();
+      // Lists are newest first, so the run goes: good chat, ssh chat (its host
+      // cannot be reached, see test/fake-ssh.sh), third chat.
+      const good = await writeTranscript(own, { prompts: 1, email: EMAIL_A, title: 'good chat' });
+      await writeRecord(own, own.a, { cliSessionId: good.cliId, title: 'good chat', lastActivityAt: Date.UTC(2026, 8, 3) });
+      const ssh = await writeSshTranscript(own, { prompts: 1 });
+      await writeRecord(own, own.a, {
+        cliSessionId: ssh.cliId,
+        title: 'ssh chat',
+        lastActivityAt: Date.UTC(2026, 8, 2),
+        ...sshRecordFields(ssh.cliId),
+        sshConfig: { sshHost: 'build@unreachable.local' },
+      });
+      const third = await writeTranscript(own, { prompts: 1, email: EMAIL_A, title: 'third chat' });
+      await writeRecord(own, own.a, { cliSessionId: third.cliId, title: 'third chat', lastActivityAt: Date.UTC(2026, 8, 1) });
+    });
+    after(async () => {
+      await destroyWorld(own);
+    });
+
+    /** Walks the transfer screen to the failure question: all of A to B as copies, the plan applied. */
+    async function reachFailureQuestion(t: Tui): Promise<void> {
+      await t.answer('What next?', KEY.enter);
+      await t.answer('Source', KEY.enter);
+      await t.answer('Target account', KEY.enter);
+      await t.answer('Which conversations to transfer to', KEY.enter);
+      await t.answer('Copy (sync)', KEY.enter);
+      await t.waitFor('Plan');
+      assert.ok(t.flat().includes('[dry-run] FAILED "ssh chat"'), t.flat());
+      await t.answer('Apply 3 operations?', 'y');
+      await t.waitFor('"ssh chat" failed. What now?');
+    }
+
+    it('(k1) stops at the failed conversation and undoes what the run did when the transfer is cancelled', { timeout: 30_000 }, async () => {
+      const t = openOwn();
+      await reachFailureQuestion(t);
+      // Skip, Continue without asking, Stop, Cancel and undo: the last.
+      t.child.stdin.write(KEY.up + KEY.enter);
+      await t.waitFor('Undone, newest first');
+      assert.ok(t.flat().includes('created "good chat" ['), t.flat());
+      await t.answer('Undo 1 operation and stop the transfer?', 'y');
+      await t.waitFor('Result');
+      await t.waitFor('1 conversation not attempted');
+      await t.waitFor('Transfer cancelled: everything it did was undone.');
+      await t.quit();
+      assert.deepEqual(await localRecords(own.b.dir), []);
+      const journal = await readLines(path.join(own.paths.dataDir, 'journal.jsonl'));
+      assert.deepEqual(
+        journal.map((entry) => [entry['action'], entry['status']]),
+        [
+          ['created', 'restored'],
+          ['none', 'done'],
+        ],
+      );
+    });
+
+    it('(k2) skips the failed conversation and goes on with the next', { timeout: 30_000 }, async () => {
+      const t = openOwn();
+      await reachFailureQuestion(t);
+      t.child.stdin.write(KEY.enter);
+      await t.waitFor('Result');
+      const result = t.flat().slice(t.flat().lastIndexOf('Result'));
+      for (const expected of ['created "good chat" on bbbbbbbb', 'FAILED "ssh chat"', 'created "third chat" on bbbbbbbb']) assert.ok(result.includes(expected), `${expected} in:\n${result}`);
+      await t.quit();
+      assert.equal((await localRecords(own.b.dir)).length, 2);
+    });
+
+    it('(k3) stops after the failed conversation, keeping what was done', { timeout: 30_000 }, async () => {
+      const t = openOwn();
+      await reachFailureQuestion(t);
+      // Stop here is the third answer.
+      t.child.stdin.write(KEY.down + KEY.down + KEY.enter);
+      await t.waitFor('Stopped; the 1 conversation left was not attempted.');
+      await t.waitFor('Result');
+      const result = t.flat().slice(t.flat().lastIndexOf('Result'));
+      assert.ok(result.includes('up to date "good chat"'), result);
+      assert.ok(!result.includes('"third chat"'), `third chat was not attempted:\n${result}`);
+      await t.quit();
+      assert.equal((await localRecords(own.b.dir)).length, 2, 'nothing undone');
+    });
+
+    it('(k4) goes on without asking again once that is confirmed, after declining it once', { timeout: 30_000 }, async () => {
+      const t = openOwn();
+      await reachFailureQuestion(t);
+      t.child.stdin.write(KEY.down + KEY.enter);
+      // The first words of the note: a note is a box wrapped at 80 columns, so
+      // a phrase from its middle may be split over two rows (see flat()).
+      await t.waitFor('The 1 conversation left are transferred one after another');
+      assert.ok(t.flat().includes('A failure or a refusal no longer stops the run'), t.flat());
+      await t.answer('Continue without asking again?', 'n');
+      await t.answer('What now?', KEY.down + KEY.enter);
+      await t.answer('Continue without asking again?', 'y');
+      await t.waitFor('Result');
+      const result = t.flat().slice(t.flat().lastIndexOf('Result'));
+      assert.ok(result.includes('up to date "third chat"'), result);
+      await t.quit();
+    });
+  });
+
+  it('(l) undoes every interrupted operation at once after a note and a confirmation', { timeout: 20_000 }, async () => {
+    const own = await makeWorld();
+    try {
+      const journal = path.join(own.paths.dataDir, 'journal.jsonl');
+      const ids = ['20261006T090000Z-c00000', '20261006T090001Z-c00001'];
+      const files = ids.map((id) => path.join(own.root, `${id}.txt`));
+      for (const [index, file] of files.entries()) {
+        await writeFile(file, 'half-written');
+        await appendFile(journal, `${JSON.stringify(cutShortEntry(ids[index] ?? '', file))}\n`);
+      }
+      const t = (tui = new Tui(own));
+      // Undo, Leave, Undo all, Leave all, Exit: the third.
+      await t.answer('What should happen to it?', KEY.down + KEY.down + KEY.enter);
+      await t.waitFor('Each is restored in turn');
+      for (const id of ids) assert.ok(t.flat().includes(`${id}: copy "cut short"`), t.flat());
+      await t.answer('Undo all 2 remaining?', 'y');
+      for (const id of ids) await t.waitFor(`Undone: ${id}`);
+      await t.quit();
+      for (const file of files) assert.equal(await pathExists(file), false, `${file} went into the backup`);
+      assert.equal(t.output().split('An earlier operation was interrupted').length - 1, 1, 'the second entry was not asked about');
+    } finally {
+      await tui?.stop();
+      tui = undefined;
+      await destroyWorld(own);
+    }
   });
 });

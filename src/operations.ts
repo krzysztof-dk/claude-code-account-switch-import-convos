@@ -1129,8 +1129,14 @@ function plannedHostUndo(entry: JournalEntry): string[] {
 /**
  * Undoes a journal entry: created files are moved into the restore's own
  * backup mirror, moves are reversed, and overwritten files are copied back
- * from the original backup (after backing up their current state, so a
- * restore can itself be restored). Host changes are undone on the host:
+ * from the original backup, after backing up their current state into the
+ * restore's own mirror. A finished restore is final: the two checks below
+ * refuse to restore a restore and to restore an entry twice (pinned in
+ * operations.test.ts), so that backup is for recovery by hand, under
+ * <backupsDir>/<restore id>. This sentence used to promise that "a restore
+ * can itself be restored", as did the README; found wrong while adding the
+ * undo of a whole run (batch.ts) on 2026-10-06, which relies on the real
+ * rule. Host changes are undone on the host:
  * created paths are set aside there, kept originals move back
  * (ssh-host.ts, undoOnHost); tombstones appended to a transcript on the host
  * stay, they only keep Remote Control off. A host that cannot be reached

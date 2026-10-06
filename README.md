@@ -171,6 +171,8 @@ npm start
 12. Choose "Quit".
 13. Start the Claude app, switch to the target account and check the Code tab.
 
+Two things can stop the screen at one conversation on the way: a conversation whose copy on the target is newer or diverged gets a question before the plan (step 10), and a conversation that fails during the run gets one then. Both are described under "Questions that stop at one conversation".
+
 ### When something goes wrong
 
 | What you see | What it means | What to do |
@@ -181,6 +183,7 @@ npm start
 | `"..." is ambiguous` or `no conversation matches "..."` | the id matches several conversations or none | run `npm start -- list --from <source>` and give a longer id (`local_...`) |
 | exit code 4, `... interrupted ...` | an earlier run was cut short | `npm start -- restore <id>` undoes it, `npm start -- resolve <id>` keeps its files as they are |
 | `FAILED` for some conversations (exit code 3) | those conversations were not copied, the rest were | read the reason on the `FAILED` line; `npm start -- restore <id>` with the `[journal <id>]` of that line cleans up what is left; running the command again finishes the copying, and conversations already copied report "up to date" |
+| in the TUI: `"<title>" failed. What now?` (or `was refused`) | a conversation failed during the run, or Claude Code appeared, and other conversations are still to come | answer the question: skip it and go on, go on without being asked again, stop here, or cancel the transfer and undo what it did (see "Questions that stop at one conversation") |
 | `FAILED ... could not reach <host> over ssh` | `ssh` cannot connect to the host without a prompt; nothing was written | do step 7 of "Before you start", then run the command again |
 | `FAILED ... <host> has no transcript <id>.jsonl` | the original is not on the host (deleted, or another host), so a copy could not be resumed there; nothing was written | look at `~/.claude/projects` on the host; the original cannot be resumed either |
 | `error: another ccas is running (PID ...)` (exit code 1) | a second ccas holds the lock on `data/` | wait for it, or remove `data/lock` when that process is gone |
@@ -207,11 +210,23 @@ npm start
 ```
 
 1. The start screen shows the directories in use and whether the app and `claude` processes run (for information). While Claude Code runs, every screen works up to the plan (a dry run), and applying is refused at the moment of writing. `npm start -- --dry-run` forces plans only, also with the app quit.
-2. "Transfer conversations": choose the source (an account or "No account"), the target account and the scope ("All N conversations", "All except the ones I pick" or "Pick them one by one"). For the last two, pick conversations from a list with a filter; the hint column shows the state against the target, the origin, the project, the date and the size. Then choose the operation (Copy or Move), decide for conversations in the "target is newer" and "diverged" states, read the plan (a dry run, which reads the host for SSH conversations) and confirm.
+2. "Transfer conversations": choose the source (an account or "No account"), the target account and the scope ("All N conversations", "All except the ones I pick" or "Pick them one by one"). For the last two, pick conversations from a list with a filter; the hint column shows the state against the target, the origin, the project, the date and the size. Then choose the operation (Copy or Move), decide for conversations in the "target is newer" and "diverged" states (one question each, see below), read the plan (a dry run, which reads the host for SSH conversations) and confirm. During the run a conversation that fails stops the run with a question (see below).
 3. "Accounts": the table of accounts, giving an account a name, and typing an e-mail by hand, only for an account whose address was not found.
 4. "Restore from journal": undo a chosen operation.
 
 After every operation that writes, start the Claude app again: it reads the records only at start-up.
+
+#### Questions that stop at one conversation
+
+Three questions stop at one item of a batch. Each offers, besides the answers for that one item, the same answer for every item left and calling the whole thing off. Those two kinds of answer are confirmed a second time, after a note that says exactly what will happen: which conversations are affected, what stays as it is, what is undone. "No" at the confirmation (also Enter alone, and Ctrl+C there) returns to the question with every answer still open.
+
+| Question | When | For this one | For all that are left | Calling it off |
+|---|---|---|---|---|
+| `"<title>": target is newer (...). What to do?` (also `diverged`) | before the plan, once per conversation whose copy on the target is newer or diverged | "Skip this conversation": the target copy stays, the result lists it as skipped. "Overwrite the target copy": the previous copy goes into backups | "Skip all N remaining conflicts", "Overwrite all N remaining conflicts": this one and the ones after it; the note lists them, and answers already given stay as given | "Cancel the transfer": nothing has been written at this point (files change only after "Apply N operations?"), the choices are discarded, back to the menu. Ctrl+C at the question does the same without asking |
+| `"<title>" failed. What now?` (or `was refused`) | during the run, after a conversation failed or the guard refused it (Claude Code appeared), while other conversations are still to come | "Skip it and continue": the next conversation is tried (after a refusal, quit Claude Code first; the guard is asked again before each one). "Stop here": what was done stays, the rest is not attempted; Ctrl+C does the same | "Continue without asking again": later failures and refusals only show in the Result box | "Cancel the transfer and undo what it did": the operations of this run are undone newest first, each undo a restore entry of its own; the note lists them with their journal ids. Claude Code must still be closed: an undo it refuses, and the ones after it, stay listed in "Restore from journal" |
+| `What should happen to it?` (an interrupted operation) | before anything writes, once per operation an earlier run left interrupted (see "Interrupted operations") | "Undo": restore it. "Leave": mark it resolved, its files stay | "Undo all N remaining", "Leave all N remaining" | "Exit": the note says what was undone so far (that stays undone: a finished restore is final), what was left, and what stays interrupted and is asked about again before the next write; exit code 4 at start-up, back to the menu inside a screen |
+
+The last conversation of a run failing asks nothing: the run is over, and "Restore from journal" undoes any single operation. The result box and the summary count a conversation skipped at the failure question as failed, since it was. The command mode does not stop at a failure (its result lines and exit code 3 report it) and answers every conflict the same way with `--on-conflict`.
 
 ### Command mode
 
@@ -447,7 +462,8 @@ The next run treats such an entry as an interrupted operation. The `transfer` an
 |---|---|
 | Undo | `restore` of the entry: created files go into the backup, moves are reversed, overwritten files come back, `*.tmp` files of a cut-short write go into the backup, host changes are undone on the host; then the tool carries on |
 | Leave | the entry gets the status "resolved" and its files stay as they are; it can still be undone later with `restore` |
-| Exit | nothing changes, exit code 4 |
+| Undo all N remaining, Leave all N remaining | the same for this entry and every one after it, after a note listing them and a confirmation (offered when more than one is left) |
+| Exit | nothing more changes, exit code 4; confirmed after a note on what was already undone (that stays undone), what was left, and what stays interrupted |
 
 Without a terminal (a script, a pipe) the tool does not ask: it ends with exit code 4 and prints both commands, `ccas restore <id>` and `ccas resolve <id>`. Commands that only read (`accounts`, `list`, `journal`, `--dry-run` runs) print a warning and carry on. `journal` shows such an entry as "interrupted".
 
@@ -472,7 +488,7 @@ Without a terminal (a script, a pipe) the tool does not ask: it ends with exit c
 - One ccas at a time: the TUI, `transfer`, `restore` and `resolve` hold `data/lock` (the pid inside) while they run. A second one refuses with the holder's pid; the lock of a process that is gone is taken over with a warning. The lock is removed when the process exits, also when the prompt library ends it on Ctrl+C during a spinner.
 - The steps on an SSH host do not wait for SSH sessions on that host to end: they only create new files next to the original and move the transcript into place last.
 - Every file is written through a temporary file and `rename`. Nothing is deleted: removing means moving into `data/backups/<operation id>/`, keeping the full path. Copied transcripts and directories get the permission bits of their source, records 0600, as the app writes them. The tool's own `data/` and `data/backups/` are 0700 and its state files 0600: the summary cache holds the first prompt and the e-mails of every transcript on the machine.
-- Every operation has an entry in `data/journal.jsonl` (what was created, moved and backed up), written before each step and flushed to the disk together with its directory entry. `restore <id>` reverses an entry and is itself an entry, so a restore can be undone too.
+- Every operation has an entry in `data/journal.jsonl` (what was created, moved and backed up), written before each step and flushed to the disk together with its directory entry. `restore <id>` reverses an entry and is itself an entry. A finished restore is final: the tool refuses to restore a restore and to restore an entry twice. The files a restore replaced are kept under `data/backups/<restore id>/` for recovery by hand.
 - `--dry-run` and the "Plan" screen of the TUI show the effects without touching files.
 - Transcripts are processed as streams, multi-megabyte ones included. A multi-byte character cut by a read-block boundary is put back together, so a copy is byte for byte identical to the original apart from the session id.
 
@@ -535,7 +551,9 @@ Modules in `src/`:
 | `inventory.ts` | the full picture: conversations per account, transcripts without a record, links between copies, the state against a target |
 | `operations.ts` | Copy, Move, Import, Restore, repairing older copies |
 | `operation-log.ts` | the journal entry and backups of one operation, written ahead of each step |
-| `interrupted.ts`, `tui/interrupted.ts` | interrupted operations: description, instructions, the question |
+| `batch.ts` | undoing the operations of one run as a whole, newest first (the "cancel the transfer" answer of the failure question) |
+| `interrupted.ts`, `tui/interrupted.ts` | interrupted operations: description, instructions, the question (with "all" answers and a confirmed Exit) |
+| `tui/decide.ts` | a question about one item of a batch whose answers can reach the rest of it, each such answer confirmed after a note |
 | `journal.ts`, `lineage.ts`, `summary-cache.ts` | the tool's state |
 | `app-guard.ts` | detecting a running app and CLI processes, through the process list and the CLI's session index |
 | `lock.ts` | one writing ccas at a time per data directory |
