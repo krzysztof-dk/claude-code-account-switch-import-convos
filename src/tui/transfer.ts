@@ -1,36 +1,44 @@
 // The transfer screen: pick a source (an account or the unlisted transcripts),
 // a target account, the conversations (all of them, all but some, or some),
-// the mode, decide conflicts one by one, review a dry-run plan and apply it.
-// Planning looks at the SSH hosts of the conversations that run on one (read
-// only, see ssh-host.ts), so it can take a few seconds per host conversation.
+// answer one question per conversation the target already holds, review a
+// dry-run plan and apply it. Planning looks at the SSH hosts of the
+// conversations that run on one (read only, see ssh-host.ts), so it can take
+// a few seconds per host conversation. The tool copies only: the "Operation"
+// choice (Copy or Move) went on 2026-10-07 with the move path (operations.ts).
 //
 // Two questions stop at one conversation, both asked through ./decide.ts so
-// an answer can reach the rest of the batch: the conflict question before
-// the plan, for a conversation whose target copy is newer or diverged, and
-// the failure question during the run, after a conversation failed or was
-// refused while others are still to come. Besides the answer for that one
-// conversation, both offer the same answer for every conversation left and
+// an answer can reach the rest of the batch:
+//   - the pair question before the plan, for every conversation whose linked
+//     copy the target already holds. It says whether the two are the same or
+//     different and which one is longer (pairKindOf, describePair), and the
+//     answers depend on that kind: skip, keep or copy for an identical pair,
+//     copy or skip where the source is longer, skip or overwrite where the
+//     target is longer or the two diverged. Until 2026-10-07 only the last
+//     two kinds were asked about; identical pairs were silently "up to date"
+//     (each SSH one costing a host probe for the repair of old copies) and
+//     a copy that was behind was updated without a question. The operator
+//     asked to see every pair and to answer once or for all of its kind.
+//   - the failure question during the run, after a conversation failed or
+//     was refused while others are still to come.
+// Besides the answer for that one conversation, both offer the same answer
+// for every conversation left (of the same kind, for the pair question) and
 // calling the transfer off, each confirmed after a note on what exactly
 // happens. Calling the transfer off before the plan discards the choices
 // made (nothing is written before "Apply N operations?"); during the run it
 // undoes what the run did so far (batch.ts). Asked for by the operator on
 // 2026-10-06, when a sync of 632 conversations stopped at its first
 // "target is newer" question.
+//
+// Every spinner message, question and result line carries the position of
+// the conversation in the run ("3/31", "[3/31]"), so a long run says how far
+// it got (cli.ts, Position; asked for by the operator on 2026-10-07).
 import * as p from '@clack/prompts';
 import { accountKey, accountLabel, type AccountInfo } from '../accounts.ts';
 import { describeBatchUndo, journalIdsOf, undoBatch, type BatchUndoResult } from '../batch.ts';
-import { describeOutcome } from '../cli.ts';
+import { describeOutcome, positionPrefix, type Position } from '../cli.ts';
 import { describeComparison, describeFlags, describeOrigin, describeState, formatSize, formatWhen, shortenPath, truncate } from '../format.ts';
 import { assessSync, conversationsOf, type Conversation, type SyncAssessment } from '../inventory.ts';
-import {
-  executeTransfer,
-  type ConflictPolicy,
-  type OperationContext,
-  type OutcomeAction,
-  type TransferItem,
-  type TransferMode,
-  type TransferOutcome,
-} from '../operations.ts';
+import { executeTransfer, type ExistingPolicy, type OperationContext, type OutcomeAction, type TransferItem, type TransferOutcome } from '../operations.ts';
 import type { TuiContext } from './context.ts';
 import { decide, indented, tally, type Answer } from './decide.ts';
 import { settleInterruptedInTui } from './interrupted.ts';
@@ -38,7 +46,7 @@ import { settleInterruptedInTui } from './interrupted.ts';
 const UNLISTED = 'none';
 
 /** The outcomes that changed files on the target: after them the app has something new to show. */
-const WRITE_ACTIONS = new Set<OutcomeAction>(['created', 'updated', 'repaired', 'moved']);
+const WRITE_ACTIONS = new Set<OutcomeAction>(['created', 'updated', 'repaired']);
 
 function accountOption(account: AccountInfo): { value: string; label: string; hint: string } {
   const bits = [account.email ?? 'e-mail unknown', `${account.sessionCount} session${account.sessionCount === 1 ? '' : 's'}`];
@@ -47,9 +55,16 @@ function accountOption(account: AccountInfo): { value: string; label: string; hi
   return { value: accountKey(account.accountId, account.orgId), label: accountLabel(account), hint: bits.join(' | ') };
 }
 
+/**
+ * The hint column of the picker: the state against the target with the
+ * comparison behind it when there is one ("update available (target lacks
+ * 3 lines)"), so the list already shows which pairs are the same and which
+ * side is longer; then the origin, the project, the date and the size.
+ */
 function conversationHint(conversation: Conversation, assessment: SyncAssessment, accounts: readonly AccountInfo[]): string {
+  const comparison = describeComparison(assessment);
   const bits = [
-    describeState(assessment.state),
+    comparison ? `${describeState(assessment.state)} (${comparison})` : describeState(assessment.state),
     describeOrigin(conversation, accounts),
     shortenPath(conversation.cwd, 28),
     formatWhen(conversation.lastActivityAt),
@@ -60,9 +75,10 @@ function conversationHint(conversation: Conversation, assessment: SyncAssessment
   return bits.join(' | ');
 }
 
-function outcomeLines(outcomes: readonly TransferOutcome[]): string {
+/** The result lines of the Plan and Result boxes, each with its position out of `total` (the whole run, also when it stopped early). */
+function outcomeLines(outcomes: readonly TransferOutcome[], total: number): string {
   return outcomes
-    .flatMap((outcome) => [describeOutcome(outcome), ...outcome.warnings.map((warning) => `  warning: ${warning}`)])
+    .flatMap((outcome, index) => [describeOutcome(outcome, { index: index + 1, total }), ...outcome.warnings.map((warning) => `  warning: ${warning}`)])
     .join('\n');
 }
 
@@ -106,64 +122,263 @@ export interface Assessed {
   assessment: SyncAssessment;
 }
 
-/** Whether the transfer asks about a conversation before the plan: its target copy is newer than the source, or diverged from it. */
-export function isConflict(entry: Assessed): boolean {
-  return entry.assessment.state === 'target-ahead' || entry.assessment.state === 'diverged';
+/**
+ * The four kinds of pair the transfer asks about, from the state assessSync
+ * (inventory.ts) gives a conversation whose linked copy the target holds:
+ *   same           the two transcripts are identical (state up-to-date)
+ *   source-longer  the copy is behind the source, or has no transcript (update-available)
+ *   target-longer  the copy went further than the source (target-ahead)
+ *   diverged       both went on after the copy was made (diverged)
+ * The "all" answers reach only the pairs of the same kind, so skipping every
+ * identical pair leaves the ones where the source is longer still asked
+ * about. The other states (new, no-transcript, unrelated, ambiguous) are not
+ * asked about: there is nothing to compare, or the copy is never touched.
+ */
+export type PairKind = 'same' | 'source-longer' | 'target-longer' | 'diverged';
+
+/** The kind of pair a selected conversation makes with its copy on the target, or null when the transfer does not ask about it. */
+export function pairKindOf(entry: Assessed): PairKind | null {
+  switch (entry.assessment.state) {
+    case 'up-to-date':
+      return 'same';
+    case 'update-available':
+      return 'source-longer';
+    case 'target-ahead':
+      return 'target-longer';
+    case 'diverged':
+      return 'diverged';
+    default:
+      return null;
+  }
 }
 
-/** '"title" (target is newer: target has 1 extra line)': one conflicting conversation as the notes list it. */
-export function describeConflict(entry: Assessed): string {
-  return `"${truncate(entry.conversation.title, 60)}" (${describeState(entry.assessment.state)}: ${describeComparison(entry.assessment)})`;
+/** "12 lines", "1 line": a count of transcript lines (the lines with a uuid, which the comparison counts). */
+function lines(count: number): string {
+  return `${count} line${count === 1 ? '' : 's'}`;
 }
 
 /**
- * The answers to the conflict question: skip or overwrite for the one
- * conversation asked about; the same for every conflict left (this one and
- * the ones after it), offered when more than one is left; and calling the
- * transfer off. The last three are confirmed after a note that lists the
- * conversations involved, or says that nothing has been written.
+ * What the pair question says after the title: whether the two are the same
+ * or different, and which one is longer, with the length of each side in
+ * lines (the shared start plus what each side added, the numbers behind
+ * describeComparison in format.ts). A copy without a transcript has no
+ * comparison; its source's own line count is shown then.
  */
-export type ConflictAnswer = 'skip' | 'overwrite' | 'skip-all' | 'overwrite-all' | 'cancel';
+export function describePair(entry: Assessed): string {
+  const comparison = entry.assessment.comparison;
+  const kind = pairKindOf(entry);
+  if (!comparison) {
+    const sourceLines = entry.conversation.summary?.uuidChain.length ?? 0;
+    return kind === 'source-longer' ? `differs: the target copy has no transcript (source ${lines(sourceLines)})` : describeState(entry.assessment.state);
+  }
+  const source = comparison.commonPrefix + comparison.sourceExtra;
+  const target = comparison.commonPrefix + comparison.targetExtra;
+  switch (kind) {
+    case 'same':
+      return `is the same on both accounts (${lines(source)} each)`;
+    case 'source-longer':
+      return `differs: the source is longer (source ${lines(source)}, target ${target})`;
+    case 'target-longer':
+      return `differs: the target is longer (source ${lines(source)}, target ${target})`;
+    case 'diverged': {
+      const longer = source > target ? 'the source is longer' : source < target ? 'the target is longer' : 'both the same length';
+      return `differs: both went on after ${lines(comparison.commonPrefix)} shared (source ${lines(source)}, target ${target}; ${longer})`;
+    }
+    default:
+      return describeState(entry.assessment.state);
+  }
+}
+
+/** '[7/31] "title" is the same on both accounts (12 lines each). What to do?': the pair question with its position in the run. */
+export function pairQuestion(at: Position, entry: Assessed): string {
+  return `${positionPrefix(at)}"${truncate(entry.conversation.title, 60)}" ${describePair(entry)}. What to do?`;
+}
+
+/** '"title" differs: the source is longer (source 20 lines, target 12)': one pair as the notes list it. */
+export function describeListedPair(entry: Assessed): string {
+  return `"${truncate(entry.conversation.title, 60)}" ${describePair(entry)}`;
+}
 
 /**
- * Builds the answers for the conflict question about `remaining[0]`, with
- * the other conflicts still to be asked about after it and the answers
- * already given (they stay as given; the notes say so).
+ * The answers to the pair question. The single ones: skip (leave the copy
+ * as it is, listed as skipped), keep (an identical pair only: up to date as
+ * before, repairing an old copy) and overwrite (copy: the target copy is
+ * brought up to date, or replaced by the source). Then the same for every
+ * pair of the same kind left (this one and the ones after it), offered when
+ * more than one is left; and calling the transfer off. The "all" answers and
+ * cancel are confirmed after a note that lists the pairs involved, or says
+ * that nothing has been written.
  */
-export function conflictAnswers(remaining: readonly Assessed[], decided: readonly ConflictPolicy[]): Answer<ConflictAnswer>[] {
+export type PairAnswer = 'skip' | 'keep' | 'overwrite' | 'skip-all' | 'keep-all' | 'overwrite-all' | 'cancel';
+
+/** A single answer of the pair question, as given and recapped in the notes. */
+export type PairDecision = 'skip' | 'keep' | 'overwrite';
+
+/** The policy executeTransfer gets for each single answer (operations.ts, ExistingPolicy). */
+export const POLICY_OF: Readonly<Record<PairDecision, ExistingPolicy>> = { skip: 'skip', keep: 'sync', overwrite: 'overwrite' };
+
+/** How many items a note lists before it says how many more there are. */
+export const NOTE_LIST_LIMIT = 10;
+
+/**
+ * The lines of a note that lists items: the first NOTE_LIST_LIMIT, then one
+ * line with the count of the rest. The conflict note and the undo note of
+ * the failure question used to list every item in full; found while
+ * extending the question to identical pairs on 2026-10-07, where a sync of
+ * hundreds of conversations would have drawn a note box hundreds of lines
+ * tall for "Skip all" (and for an undo after hundreds of copies).
+ */
+export function listed(items: readonly string[]): string {
+  if (items.length <= NOTE_LIST_LIMIT) return indented(items);
+  return indented([...items.slice(0, NOTE_LIST_LIMIT), `... and ${items.length - NOTE_LIST_LIMIT} more`]);
+}
+
+/** One single answer of the pair question with the words of its "all" counterpart. */
+interface SingleAnswer {
+  value: PairDecision;
+  label: string;
+  hint: string;
+  all: { label: string; title: string; note: string; question: string };
+}
+
+/** The journal sentence every overwriting "all" note ends with. */
+const UNDOABLE = 'The previous copy goes into backups, as a journal entry of its own that "Restore from journal" undoes.';
+
+/**
+ * The single answers of each kind, in the order they are offered: first the
+ * one the operator asked for on 2026-10-07 (skip for an identical pair, copy
+ * where the source is longer), so Enter alone takes it; for a newer or
+ * diverged copy skip comes first, as before, since overwriting loses what
+ * the target added.
+ */
+function singleAnswers(kind: PairKind, count: number): SingleAnswer[] {
+  const skipAll = (where: string, note: string): SingleAnswer['all'] => ({
+    label: `Skip all ${count} remaining ${where}`,
+    title: 'Skip all',
+    note,
+    question: `Skip all ${count} remaining ${where}?`,
+  });
+  switch (kind) {
+    case 'same':
+      return [
+        {
+          value: 'skip',
+          label: 'Skip this conversation',
+          hint: 'nothing is done and the SSH host is not asked; the result lists it as skipped',
+          all: skipAll('identical conversations', 'Skipped: nothing is done to any of them, and the result lists each as skipped.'),
+        },
+        {
+          value: 'keep',
+          label: 'Keep it as it is (up to date)',
+          hint: 'as before: nothing is copied; a copy made before 2026-09-28 is repaired, which looks at the SSH host',
+          all: {
+            label: `Keep all ${count} remaining identical conversations`,
+            title: 'Keep all',
+            note:
+              'Kept: nothing is copied and each copy is left as it is; one made before 2026-09-28 is repaired (Remote Control off, ' +
+              'its transcript on the SSH host), as a journal entry of its own.',
+            question: `Keep all ${count} remaining identical conversations?`,
+          },
+        },
+        {
+          value: 'overwrite',
+          label: 'Copy anyway: overwrite the target copy',
+          hint: 'the transcript is the same; the record is refreshed (title, archive state); the previous copy goes into backups',
+          all: {
+            label: `Copy all ${count} remaining identical conversations anyway`,
+            title: 'Copy all anyway',
+            note: `Overwritten: each target copy is written again from its source (the same transcript, the record refreshed). ${UNDOABLE}`,
+            question: `Overwrite the target copies of all ${count} remaining identical conversations?`,
+          },
+        },
+      ];
+    case 'source-longer':
+      return [
+        {
+          value: 'overwrite',
+          label: 'Copy: bring the target copy up to date',
+          hint: 'the target gets the lines it lacks; the previous copy goes into backups',
+          all: {
+            label: `Copy all ${count} remaining where the source is longer`,
+            title: 'Copy all',
+            note: `Updated: each target copy is brought up to date with its source. ${UNDOABLE}`,
+            // Short enough not to wrap at 80 columns: clack wraps a confirm's
+            // message, and a wrapped question is hard to read (and to match).
+            question: `Copy all ${count} remaining where the source is longer?`,
+          },
+        },
+        {
+          value: 'skip',
+          label: 'Skip this conversation',
+          hint: 'the target copy stays behind; the result lists it as skipped',
+          all: skipAll('where the source is longer', 'Skipped: each target copy stays behind its source, and the result lists it as skipped.'),
+        },
+      ];
+    case 'target-longer':
+      return [
+        {
+          value: 'skip',
+          label: 'Skip this conversation',
+          hint: 'leave the target copy as it is (it has more); the result lists it as skipped',
+          all: skipAll('where the target is longer', 'Skipped: the target copy of each stays as it is, and the result lists it as skipped.'),
+        },
+        {
+          value: 'overwrite',
+          label: 'Overwrite the target copy',
+          hint: 'replace it with the shorter source; the previous copy goes into backups',
+          all: {
+            label: `Overwrite all ${count} remaining where the target is longer`,
+            title: 'Overwrite all',
+            note: `Overwritten: each target copy is replaced by its shorter source. ${UNDOABLE}`,
+            question: `Overwrite the target copies of all ${count} remaining where the target is longer?`,
+          },
+        },
+      ];
+    default:
+      return [
+        {
+          value: 'skip',
+          label: 'Skip this conversation',
+          hint: 'leave the target copy as it is; the result lists it as skipped',
+          all: skipAll('diverged conversations', 'Skipped: the target copy of each stays as it is, and the result lists it as skipped.'),
+        },
+        {
+          value: 'overwrite',
+          label: 'Overwrite the target copy',
+          hint: 'replace it with the source; what the target added since they diverged goes into backups',
+          all: {
+            label: `Overwrite all ${count} remaining diverged conversations`,
+            title: 'Overwrite all',
+            note: `Overwritten: each target copy is replaced by its source. ${UNDOABLE}`,
+            question: `Overwrite the target copies of all ${count} remaining diverged conversations?`,
+          },
+        },
+      ];
+  }
+}
+
+/**
+ * Builds the answers for the pair question about `remaining[0]`, with the
+ * other pairs of the same kind still to be asked about after it, and the
+ * single answers already given to earlier pair questions of any kind (they
+ * stay as given; the notes say so).
+ */
+export function pairAnswers(kind: PairKind, remaining: readonly Assessed[], decided: readonly PairDecision[]): Answer<PairAnswer>[] {
   const count = remaining.length;
-  const listed = indented(remaining.map(describeConflict));
+  const list = listed(remaining.map(describeListedPair));
   const earlier = decided.length > 0 ? `\nThe ${plural(decided.length, 'answer')} given before (${tally(decided)}) stay as given.` : '';
-  const answers: Answer<ConflictAnswer>[] = [
-    { value: 'skip', label: 'Skip this conversation', hint: 'leave the target copy as it is; the result lists it as skipped' },
-    { value: 'overwrite', label: 'Overwrite the target copy', hint: 'replace it with the source; the previous copy goes into backups' },
-  ];
+  const singles = singleAnswers(kind, count);
+  const answers: Answer<PairAnswer>[] = singles.map(({ value, label, hint }) => ({ value, label, hint }));
   if (count > 1) {
     const rest = `this one and the ${count - 1} after it; asks to confirm first`;
-    answers.push(
-      {
-        value: 'skip-all',
-        label: `Skip all ${count} remaining conflicts`,
+    for (const single of singles) {
+      answers.push({
+        value: `${single.value}-all`,
+        label: single.all.label,
         hint: rest,
-        confirm: {
-          title: 'Skip all',
-          note: `Skipped: the target copy of each stays as it is, and the result lists it as skipped.\n${listed}${earlier}`,
-          question: `Skip all ${count} remaining conflicts?`,
-        },
-      },
-      {
-        value: 'overwrite-all',
-        label: `Overwrite all ${count} remaining conflicts`,
-        hint: rest,
-        confirm: {
-          title: 'Overwrite all',
-          note:
-            'Overwritten: each target copy is replaced by the source. The previous copy goes into backups, ' +
-            `as a journal entry of its own that "Restore from journal" undoes.\n${listed}${earlier}`,
-          question: `Overwrite the target copies of all ${count} remaining conflicts?`,
-        },
-      },
-    );
+        confirm: { title: single.all.title, note: `${single.all.note}\n${list}${earlier}`, question: single.all.question },
+      });
+    }
   }
   const discarded = decided.length > 0 ? ` and the ${plural(decided.length, 'answer')} given so far (${tally(decided)})` : '';
   answers.push({
@@ -230,7 +445,7 @@ export function failureAnswers(outcome: TransferOutcome, done: readonly Transfer
       confirm: {
         title: 'Cancel the transfer',
         note: undoable
-          ? `Undone, newest first; each undo is a journal entry of its own:\n${indented(undoLines)}\nNot attempted: the ${leftText} left.\n` +
+          ? `Undone, newest first; each undo is a journal entry of its own:\n${listed(undoLines)}\nNot attempted: the ${leftText} left.\n` +
             'Claude Code must still be closed: an undo it refuses, and the ones after it, stay listed in "Restore from journal".'
           : `Nothing to undo: no operation of this transfer wrote anything.\nNot attempted: the ${leftText} left.`,
         question: undoable ? `Undo ${plural(undoLines.length, 'operation')} and stop the transfer?` : 'Stop the transfer?',
@@ -240,39 +455,40 @@ export function failureAnswers(outcome: TransferOutcome, done: readonly Transfer
 }
 
 /**
- * Asks about every conflicting conversation in turn and gives each item its
- * conflict policy. Returns null when the person called the transfer off
- * (confirmed) or cancelled the question (Ctrl+C or Escape): nothing has
+ * Asks the pair question about every selected conversation whose copy the
+ * target holds, in list order, and gives each item its policy
+ * (ExistingPolicy). An "all" answer settles every later pair of the same
+ * kind without a question. Returns null when the person called the transfer
+ * off (confirmed) or cancelled the question (Ctrl+C or Escape): nothing has
  * been written at this point, so there is nothing to undo.
  */
-async function decideConflicts(selected: readonly Assessed[], target: AccountInfo, mode: TransferMode): Promise<TransferItem[] | null> {
+async function decidePairs(selected: readonly Assessed[], target: AccountInfo): Promise<TransferItem[] | null> {
   const items: TransferItem[] = [];
-  const conflicts = selected.filter(isConflict);
-  const decided: ConflictPolicy[] = [];
-  let forAll: ConflictPolicy | null = null;
-  for (const entry of selected) {
-    let onConflict: ConflictPolicy = 'skip';
-    if (isConflict(entry) && forAll !== null) {
-      onConflict = forAll;
-    } else if (isConflict(entry)) {
-      // The warnings of the conflicts answered for all at once are not lost:
+  const decided: PairDecision[] = [];
+  const forAll = new Map<PairKind, ExistingPolicy>();
+  for (const [index, entry] of selected.entries()) {
+    const kind = pairKindOf(entry);
+    const settled = kind === null ? undefined : forAll.get(kind);
+    let onExisting: ExistingPolicy = 'sync';
+    if (kind !== null && settled !== undefined) {
+      onExisting = settled;
+    } else if (kind !== null) {
+      // The warnings of the pairs answered for all at once are not lost:
       // every outcome carries its assessment's warnings into the plan.
       for (const warning of entry.assessment.warnings) p.log.warn(warning);
-      const remaining = conflicts.slice(conflicts.indexOf(entry));
-      const answer = await decide(
-        `"${truncate(entry.conversation.title, 60)}": ${describeState(entry.assessment.state)} (${describeComparison(entry.assessment)}). What to do?`,
-        conflictAnswers(remaining, decided),
-      );
+      const remaining = selected.slice(index).filter((candidate) => pairKindOf(candidate) === kind);
+      const answer = await decide(pairQuestion({ index: index + 1, total: selected.length }, entry), pairAnswers(kind, remaining, decided));
       if (answer === null) return null;
       if (answer === 'cancel') {
         p.log.info('Transfer cancelled: nothing was changed.');
         return null;
       }
-      onConflict = answer === 'skip' || answer === 'skip-all' ? 'skip' : 'overwrite';
-      if (answer === 'skip-all' || answer === 'overwrite-all') forAll = onConflict;
-      decided.push(onConflict);
+      const single: PairDecision = answer === 'skip-all' ? 'skip' : answer === 'keep-all' ? 'keep' : answer === 'overwrite-all' ? 'overwrite' : answer;
+      onExisting = POLICY_OF[single];
+      if (answer !== single) forAll.set(kind, onExisting);
+      decided.push(single);
     }
-    items.push({ source: entry.conversation, target, mode, assessment: entry.assessment, onConflict });
+    items.push({ source: entry.conversation, target, assessment: entry.assessment, onExisting });
   }
   return items;
 }
@@ -308,12 +524,13 @@ async function undoRun(live: OperationContext, outcomes: readonly TransferOutcom
 }
 
 /**
- * Runs the items one after another under a spinner. A failure or a refusal
- * with conversations still to come stops the spinner, shows the result line
- * and asks the failure question (failureAnswers). Ctrl+C or Escape at that
- * question counts as "Stop here", the answer that writes and undoes nothing
- * more. The last conversation failing asks nothing: the run is over, and
- * "Restore from journal" undoes any of its operations.
+ * Runs the items one after another under a spinner that counts them. A
+ * failure or a refusal with conversations still to come stops the spinner,
+ * shows the result line and asks the failure question (failureAnswers).
+ * Ctrl+C or Escape at that question counts as "Stop here", the answer that
+ * writes and undoes nothing more. The last conversation failing asks
+ * nothing: the run is over, and "Restore from journal" undoes any of its
+ * operations.
  */
 async function runItems(context: TuiContext, live: OperationContext, items: readonly TransferItem[]): Promise<RunResult> {
   const outcomes: TransferOutcome[] = [];
@@ -321,17 +538,19 @@ async function runItems(context: TuiContext, live: OperationContext, items: read
   let spinner = p.spinner();
   spinner.start('Transferring');
   for (const [index, item] of items.entries()) {
-    spinner.message(`Transferring "${truncate(item.source.title, 40)}"`);
+    const at: Position = { index: index + 1, total: items.length };
+    const title = truncate(item.source.title, 40);
+    spinner.message(`Transferring ${at.index}/${at.total} "${title}"`);
     const outcome = await executeTransfer(live, item);
     outcomes.push(outcome);
     const left = items.length - index - 1;
     if (!ask || !isFailure(outcome) || left === 0) continue;
-    spinner.stop(`Stopped at "${truncate(item.source.title, 40)}"`);
-    p.log.error(describeOutcome(outcome));
+    spinner.stop(`Stopped at ${at.index}/${at.total} "${title}"`);
+    p.log.error(describeOutcome(outcome, at));
     for (const warning of outcome.warnings) p.log.warn(warning);
     const undoLines = await describeBatchUndo(context.journal, outcomes);
     const answer = await decide(
-      `"${truncate(item.source.title, 60)}" ${outcome.action === 'refused' ? 'was refused' : 'failed'}. What now?`,
+      `${positionPrefix(at)}"${truncate(item.source.title, 60)}" ${outcome.action === 'refused' ? 'was refused' : 'failed'}. What now?`,
       failureAnswers(outcome, outcomes, left, undoLines),
     );
     if (answer === 'skip' || answer === 'continue') {
@@ -345,18 +564,18 @@ async function runItems(context: TuiContext, live: OperationContext, items: read
     return { outcomes, notAttempted: left, undo: null };
   }
   const failed = outcomes.filter(isFailure).length;
-  spinner.stop(failed === 0 ? 'Done' : `Done with ${failed} failure(s) or refusal(s)`);
+  spinner.stop(failed === 0 ? `Done, ${plural(items.length, 'conversation')}` : `Done, ${plural(items.length, 'conversation')}, ${failed} failure(s) or refusal(s)`);
   return { outcomes, notAttempted: 0, undo: null };
 }
 
 /**
  * The "Transfer conversations" screen, start to finish: source, target,
- * scope, the picker, the mode, a decision per conflicting conversation, the
- * dry-run plan (which looks at the SSH hosts, read only), the guard, the
- * interrupted-operation check, the confirmation, the real run (which stops
- * to ask after a failure, see runItems) and a rescan. Returns early, with
- * nothing written, whenever the person cancels a prompt or the transfer
- * before the plan, the guard refuses, or the TUI runs as a dry run.
+ * scope, the picker, the pair question for every conversation the target
+ * holds, the dry-run plan (which looks at the SSH hosts, read only), the
+ * guard, the interrupted-operation check, the confirmation, the real run
+ * (which stops to ask after a failure, see runItems) and a rescan. Returns
+ * early, with nothing written, whenever the person cancels a prompt or the
+ * transfer before the plan, the guard refuses, or the TUI runs as a dry run.
  */
 export async function transferFlow(context: TuiContext): Promise<void> {
   const inventory = context.inventory;
@@ -434,35 +653,21 @@ export async function transferFlow(context: TuiContext): Promise<void> {
     p.log.info('Nothing left to transfer.');
     return;
   }
+  if (source === null) p.log.info('Unlisted transcripts are imported as copies; the originals stay untouched.');
 
-  let mode: TransferMode = 'copy';
-  if (source === null) {
-    p.log.info('Unlisted transcripts are imported as copies; the originals stay untouched.');
-  } else {
-    const modeChoice = await p.select({
-      message: 'Operation',
-      options: [
-        { value: 'copy', label: 'Copy (sync)', hint: 'the target gets its own copy; copying again later updates it' },
-        { value: 'move', label: 'Move', hint: 'like copy, then the source side is removed (into backups)' },
-      ],
-    });
-    if (p.isCancel(modeChoice)) return;
-    mode = modeChoice;
-  }
-
-  const items = await decideConflicts(selected, target, mode);
+  const items = await decidePairs(selected, target);
   if (items === null) return;
 
   const dryRun = { paths: context.paths, journal: context.journal, lineage: context.lineage, dryRun: true };
   const plan: TransferOutcome[] = [];
   const planning = p.spinner();
   planning.start('Planning');
-  for (const item of items) {
-    planning.message(`Planning "${truncate(item.source.title, 40)}"`);
+  for (const [index, item] of items.entries()) {
+    planning.message(`Planning ${index + 1}/${items.length} "${truncate(item.source.title, 40)}"`);
     plan.push(await executeTransfer(dryRun, item));
   }
-  planning.stop('Planned');
-  p.note(outcomeLines(plan), 'Plan');
+  planning.stop(`Planned ${plural(items.length, 'conversation')}`);
+  p.note(outcomeLines(plan, items.length), 'Plan');
 
   if (context.dryRun) {
     p.log.info('Dry run: nothing was changed. Start without --dry-run to apply.');
@@ -492,7 +697,7 @@ export async function transferFlow(context: TuiContext): Promise<void> {
 
   const live = { ...dryRun, dryRun: false };
   const run = await runItems(context, live, items);
-  p.note(outcomeLines(run.outcomes), 'Result');
+  p.note(outcomeLines(run.outcomes, items.length), 'Result');
   if (run.notAttempted > 0) {
     p.log.info(`${plural(run.notAttempted, 'conversation')} not attempted; transferring the same conversations again continues where this run stopped (the ones done report up to date).`);
   }

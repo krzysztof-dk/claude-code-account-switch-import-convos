@@ -353,7 +353,8 @@ export interface ProbeRequest {
  * every project folder, as the app does), whether the copy already has a
  * transcript or side folder there, and whether that transcript still links
  * up with a claude.ai session. The source and target ids may be the same, to
- * look at one conversation's own transcript (a move).
+ * look at one conversation's own transcript (the repair of a copy whose
+ * original's id is unknown, operations.ts planRepair).
  */
 export function probeScript(request: ProbeRequest): string {
   assertId(request.sourceCliSessionId, 'session id');
@@ -604,10 +605,10 @@ export async function copyOnHost(runner: HostRunner, target: HostTarget, request
 }
 
 /**
- * Ends the Remote Control links of a transcript already on the host (a moved
- * conversation, or a copy the host has already): appends the tombstones in
- * place. Appending is safe next to a CLI that still writes the file, since
- * both only ever append whole lines.
+ * Ends the Remote Control links of a transcript already on the host (the
+ * repair of a copy the host has already; before 2026-10-07 also a moved
+ * conversation): appends the tombstones in place. Appending is safe next to
+ * a CLI that still writes the file, since both only ever append whole lines.
  */
 export function tombstoneScript(transcriptPath: string): string {
   return [

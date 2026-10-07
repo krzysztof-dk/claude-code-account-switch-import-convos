@@ -12,7 +12,8 @@
 // whether two of them are "the same", similar, short or unfinished. A
 // conversation on the source and one on the target are treated as one
 // conversation (a copy to bring up to date) only on explicit evidence:
-//   (a) they have the same record id (a record moved between accounts)
+//   (a) they have the same record id (a record moved between accounts by a
+//       version of this tool from before 2026-10-07, or by hand)
 //   (b) lineage.json links them, in either direction (for a transcript
 //       without a record, by its CLI session id)
 //   (c) the ccas stamp of either record names the other one
@@ -261,12 +262,13 @@ function linkConversations(conversations: readonly Conversation[], links: readon
 
 /**
  * The e-mail a listed conversation may vote with. A copy made by this tool
- * (and a moved record, whose transcript is the same file as before) still
- * carries the source account's session_context lines, so only sightings
- * past the copy point count: those were written after the target account
- * continued the conversation. The copy point comes from the record stamp,
- * or from lineage when the app dropped the stamp; every copy, update and
- * move writes a link with its sourceLineCount for exactly this purpose
+ * (and a record moved by a version from before 2026-10-07, whose transcript
+ * is the same file as before) still carries the source account's
+ * session_context lines, so only sightings past the copy point count: those
+ * were written after the target account continued the conversation. The
+ * copy point comes from the record stamp, or from lineage when the app
+ * dropped the stamp; every copy and update (and every move, back then)
+ * writes a link with its sourceLineCount for exactly this purpose
  * (lineage.ts), and the largest count wins when there are several.
  */
 function voteEmail(conversation: Conversation, lineage: LineageStore | undefined): string | null {

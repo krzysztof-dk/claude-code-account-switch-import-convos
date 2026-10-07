@@ -6,7 +6,7 @@
 //   ccas [--dry-run]                       interactive TUI (dry run: plans only)
 //   ccas accounts [--json]                 accounts, e-mails, names
 //   ccas list --from <acct|none> [--to <acct>] [--json]
-//   ccas transfer --from <acct|none> --to <acct> --mode copy|move
+//   ccas transfer --from <acct|none> --to <acct>
 //                 (--session <id> [--session <id> ...] | --all [--exclude <id> ...])
 //                 [--on-conflict skip|overwrite] [--dry-run]
 //   ccas journal [--json]                  past operations
@@ -28,6 +28,11 @@
 // Conversations that run on an SSH host are copied on that host too, over
 // the Mac's ssh (ssh-host.ts); a dry run looks at the host as well, read
 // only. CCAS_SSH names another ssh program (the tests use a stand-in).
+//
+// The tool copies only. `--mode copy|move` existed until 2026-10-07, when
+// the operator asked for the move path to go; a command line that still
+// says --mode is a usage error now (parseArgs is strict), which is what
+// points an old script at this change.
 import { readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -45,10 +50,9 @@ import { LineageStore } from './lineage.ts';
 import {
   executeTransfer,
   restoreEntry,
-  type ConflictPolicy,
+  type ExistingPolicy,
   type OutcomeAction,
   type TransferItem,
-  type TransferMode,
   type TransferOutcome,
 } from './operations.ts';
 import { packageRoot, resolvePaths, type Paths } from './paths.ts';
@@ -76,13 +80,13 @@ export const EXIT_PARTIAL = 3;
  */
 export const EXIT_INTERRUPTED = 4;
 
-const USAGE = `ccas - move or copy Claude Code Desktop conversations between accounts
+const USAGE = `ccas - copy Claude Code Desktop conversations between accounts
 
 Usage:
   ccas [--dry-run]                              interactive mode (--dry-run: plans only, never writes)
   ccas accounts [--json]
   ccas list --from <account|none> [--to <account>] [--json]
-  ccas transfer --from <account|none> --to <account> --mode copy|move
+  ccas transfer --from <account|none> --to <account>
                 (--session <id> [--session <id> ...] | --all [--exclude <id> ...])
                 [--on-conflict skip|overwrite] [--dry-run]
   ccas journal [--json]
@@ -97,8 +101,8 @@ Global options:
 
 Conversations on an SSH host are also copied on the host, over ssh in batch
 mode: "ssh <host> true" must work without a prompt. CCAS_SSH=<program> uses
-another ssh. Copies and moves switch Remote Control off; copies made before
-that are repaired when transferred again.
+another ssh. Copies switch Remote Control off; copies made before that are
+repaired when transferred again. The source is never changed.
 
 Exit codes: 0 ok, 1 usage or other error, 2 writes refused (Claude Code running),
 3 part of a transfer failed, 4 an interrupted operation needs restore or resolve.
@@ -225,14 +229,31 @@ function conversationRow(conversation: Conversation, accounts: readonly AccountI
 }
 
 /**
+ * Where a conversation stands in its run: its 1-based position and how many
+ * the run has. Shown as "[3/31]" in front of result lines and questions, and
+ * as "3/31" in the TUI spinners, so a long run says how far it got (asked
+ * for by the operator on 2026-10-07).
+ */
+export interface Position {
+  index: number;
+  total: number;
+}
+
+/** "[3/31] ": the prefix a position puts in front of a line. */
+export function positionPrefix(at: Position | undefined): string {
+  return at ? `[${at.index}/${at.total}] ` : '';
+}
+
+/**
  * One result line of a transfer, as `ccas transfer` prints it and the TUI
  * shows it: what happened to the conversation and on which account, with
  * the new record id, the SSH host step and the journal id where there are
- * any. A dry run gets a "[dry-run] " prefix.
+ * any. The position in the run comes first ("[3/31] "), then "[dry-run] "
+ * for a dry run, so the "[dry-run] created" wording stays searchable.
  */
-export function describeOutcome(outcome: TransferOutcome): string {
+export function describeOutcome(outcome: TransferOutcome, at?: Position): string {
   const target = accountLabel(outcome.item.target);
-  const prefix = outcome.dryRun ? '[dry-run] ' : '';
+  const prefix = `${positionPrefix(at)}${outcome.dryRun ? '[dry-run] ' : ''}`;
   const ids = outcome.newSessionId ? ` as ${outcome.newSessionId}` : '';
   const reason = outcome.reason ? `: ${outcome.reason}` : '';
   const journal = outcome.journalId ? ` [journal ${outcome.journalId}]` : '';
@@ -245,8 +266,6 @@ export function describeOutcome(outcome: TransferOutcome): string {
       return `${prefix}updated "${title}" on ${target}${host}${journal}`;
     case 'repaired':
       return `${prefix}repaired "${title}" on ${target}${reason}${journal}`;
-    case 'moved':
-      return `${prefix}moved "${title}" to ${target}${reason}${host}${journal}`;
     case 'up-to-date':
       return `${prefix}up to date "${title}" on ${target}`;
     case 'skipped':
@@ -260,8 +279,8 @@ export function describeOutcome(outcome: TransferOutcome): string {
 
 /**
  * The last line of a transfer: how many conversations ended how. The six
- * counts always appear, in this order; repaired, moved and refused only when
- * some were.
+ * counts always appear, in this order; repaired and refused only when some
+ * were.
  */
 export function summaryLine(tally: ReadonlyMap<OutcomeAction, number>, excluded: number): string {
   const count = (action: OutcomeAction): number => tally.get(action) ?? 0;
@@ -274,19 +293,21 @@ export function summaryLine(tally: ReadonlyMap<OutcomeAction, number>, excluded:
     `${count('failed')} failed`,
   ];
   if (count('repaired') > 0) parts.push(`${count('repaired')} repaired`);
-  if (count('moved') > 0) parts.push(`${count('moved')} moved`);
   if (count('refused') > 0) parts.push(`${count('refused')} refused`);
   return `summary: ${parts.join(', ')}`;
 }
 
-/** Builds the transfer items for a batch, resolving conflicts with one policy. */
-export function planTransfers(
-  inventory: Inventory,
-  target: AccountInfo,
-  conversations: readonly Conversation[],
-  mode: TransferMode,
-  onConflict: ConflictPolicy,
-): TransferItem[] {
+/**
+ * The policy --on-conflict stands for (operations.ts, ExistingPolicy): the
+ * command line never skips an identical or a behind copy, it only decides
+ * whether a newer or diverged one is overwritten.
+ */
+export function policyOf(onConflict: 'skip' | 'overwrite'): ExistingPolicy {
+  return onConflict === 'overwrite' ? 'overwrite-conflicts' : 'sync';
+}
+
+/** Builds the transfer items for a batch, every one with the same policy for an existing copy. */
+export function planTransfers(inventory: Inventory, target: AccountInfo, conversations: readonly Conversation[], onExisting: ExistingPolicy): TransferItem[] {
   // The source account used to be a parameter here, unused since the
   // conversations are passed in already chosen; dropped in the review of
   // 2026-10-05, found while reading the command module.
@@ -294,9 +315,8 @@ export function planTransfers(
   return conversations.map((conversation) => ({
     source: conversation,
     target,
-    mode,
     assessment: assessSync(conversation, targetConversations),
-    onConflict,
+    onExisting,
   }));
 }
 
@@ -408,13 +428,13 @@ async function runList(session: Session, io: Io, from: string, to: string | unde
 interface TransferOptions {
   from: string;
   to: string;
-  mode: TransferMode;
   /** Conversations named one by one (--session). */
   sessions: string[];
   /** Every conversation of the source (--all), minus `excludes`. */
   all: boolean;
   excludes: string[];
-  onConflict: ConflictPolicy;
+  /** What --on-conflict stands for (policyOf). */
+  onExisting: ExistingPolicy;
   dryRun: boolean;
 }
 
@@ -440,7 +460,7 @@ async function planTransfer(session: Session, options: TransferOptions): Promise
   const chosen = options.all
     ? pool.filter((conversation) => !excluded.includes(conversation))
     : [...new Set(options.sessions.map((selector) => findConversation(pool, selector)))];
-  return { excluded, items: planTransfers(inventory, target, chosen, options.mode, options.onConflict), inventory };
+  return { excluded, items: planTransfers(inventory, target, chosen, options.onExisting), inventory };
 }
 
 async function runTransfer(session: Session, io: Io, options: TransferOptions): Promise<number> {
@@ -465,13 +485,13 @@ async function runTransfer(session: Session, io: Io, options: TransferOptions): 
   for (const conversation of plan.excluded) io.out(`${prefix}excluded "${truncate(conversation.title, 60)}" (${conversationId(conversation)})\n`);
   const context = { paths: session.paths, journal: session.journal, lineage: session.lineage, dryRun: options.dryRun };
   const tally = new Map<OutcomeAction, number>();
-  for (const item of plan.items) {
+  for (const [index, item] of plan.items.entries()) {
     const outcome = await executeTransfer(context, item);
-    io.out(`${describeOutcome(outcome)}\n`);
+    io.out(`${describeOutcome(outcome, { index: index + 1, total: plan.items.length })}\n`);
     for (const warning of outcome.warnings) io.out(`  warning: ${warning}\n`);
     tally.set(outcome.action, (tally.get(outcome.action) ?? 0) + 1);
   }
-  const wrote = (['created', 'updated', 'repaired', 'moved'] as const).some((action) => (tally.get(action) ?? 0) > 0);
+  const wrote = (['created', 'updated', 'repaired'] as const).some((action) => (tally.get(action) ?? 0) > 0);
   if (!options.dryRun && wrote) {
     io.out('Start the Claude app to see the result; it reads session records at start-up.\n');
   }
@@ -548,7 +568,6 @@ const OPTION_SPEC = {
     'dry-run': { type: 'boolean' as const },
     from: { type: 'string' as const },
     to: { type: 'string' as const },
-    mode: { type: 'string' as const },
     session: { type: 'string' as const, multiple: true as const },
     all: { type: 'boolean' as const },
     exclude: { type: 'string' as const, multiple: true as const },
@@ -603,7 +622,6 @@ export async function main(argv: string[], io: Io): Promise<number> {
         return await runList(session, io, values.from, values.to, values.json === true);
       case 'transfer': {
         if (!values.from || !values.to) throw new Error('transfer needs --from and --to');
-        if (values.mode !== 'copy' && values.mode !== 'move') throw new Error('transfer needs --mode copy|move');
         const onConflict = values['on-conflict'] ?? 'skip';
         if (onConflict !== 'skip' && onConflict !== 'overwrite') throw new Error('--on-conflict must be skip or overwrite');
         const sessions = values.session ?? [];
@@ -615,11 +633,10 @@ export async function main(argv: string[], io: Io): Promise<number> {
         const options: TransferOptions = {
           from: values.from,
           to: values.to,
-          mode: values.mode,
           sessions,
           all,
           excludes,
-          onConflict,
+          onExisting: policyOf(onConflict),
           dryRun: values['dry-run'] === true,
         };
         return options.dryRun ? await runTransfer(session, io, options) : await underLock(session, io, () => runTransfer(session, io, options));

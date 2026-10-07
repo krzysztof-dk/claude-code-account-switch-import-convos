@@ -1,8 +1,8 @@
-# ccas: move Claude Code Desktop conversations between accounts
+# ccas: copy Claude Code Desktop conversations between accounts
 
 ![The ccas start screen: the Environment box with the data directories and the running app and CLI processes, then the main menu](ccas-tui-1.png)
 
-A macOS tool that copies or moves conversations from the Code tab of the Claude desktop app between signed-in accounts. It works on the files the app keeps on disk, has a text interface (TUI) and a command mode for scripts. Every operation leaves a backup and a journal entry, and can be undone.
+A macOS tool that copies conversations from the Code tab of the Claude desktop app between signed-in accounts. It works on the files the app keeps on disk, has a text interface (TUI) and a command mode for scripts. The source account is never changed. Every operation leaves a backup and a journal entry, and can be undone.
 
 ## Quick start
 
@@ -16,11 +16,11 @@ Copy every conversation of one account to another, leaving out the ones you choo
 The first line only shows the plan (dry run), the second one copies:
 
 ```bash
-cd <repo dir> && nvm use >/dev/null && npm start -- transfer --from <source> --to <target> --mode copy --all --exclude <id-1> --exclude <id-2> --dry-run
+cd <repo dir> && nvm use >/dev/null && npm start -- transfer --from <source> --to <target> --all --exclude <id-1> --exclude <id-2> --dry-run
 ```
 
 ```bash
-cd <repo dir> && nvm use >/dev/null && npm start -- transfer --from <source> --to <target> --mode copy --all --exclude <id-1> --exclude <id-2>
+cd <repo dir> && nvm use >/dev/null && npm start -- transfer --from <source> --to <target> --all --exclude <id-1> --exclude <id-2>
 ```
 
 Then start the Claude app, switch to the target account and look at the Code tab.
@@ -115,18 +115,18 @@ ssh -o BatchMode=yes <host> true
 1. Do a dry run. Nothing is written, you only see the plan:
 
 ```bash
-npm start -- transfer --from <source> --to <target> --mode copy --all --exclude <id-1> --exclude <id-2> --dry-run
+npm start -- transfer --from <source> --to <target> --all --exclude <id-1> --exclude <id-2> --dry-run
 ```
 
-   Expected: `[dry-run] excluded "..."` lines for the conversations left out, `[dry-run] created "..."` for the others (for SSH conversations followed by `transcript also on <host>`), and at the end `[dry-run] summary: ... created, 0 updated, 0 up to date, 0 skipped, 2 excluded, 0 failed`.
+   Expected: `[dry-run] excluded "..."` lines for the conversations left out, `[1/31] [dry-run] created "..."` for the others, each with its number in the run (for SSH conversations followed by `transcript also on <host>`), and at the end `[dry-run] summary: ... created, 0 updated, 0 up to date, 0 skipped, 2 excluded, 0 failed`.
 
 2. Copy for real:
 
 ```bash
-npm start -- transfer --from <source> --to <target> --mode copy --all --exclude <id-1> --exclude <id-2>
+npm start -- transfer --from <source> --to <target> --all --exclude <id-1> --exclude <id-2>
 ```
 
-   Expected at the end: `summary: ... created, 0 updated, 0 up to date, 0 skipped, 2 excluded, 0 failed`, with the same number of `created` as in the dry run.
+   Expected at the end: `summary: ... created, 0 updated, 0 up to date, 0 skipped, 2 excluded, 0 failed`, with the same number of `created` as in the dry run. The result lines appear one by one as the conversations are copied, each numbered `[n/N]`.
 
 3. Start the Claude app, switch to the target account and check in the Code tab that the conversations have the same titles, SSH host and archive state.
 
@@ -139,7 +139,7 @@ In the TUI you pick conversations by title. Before the list it asks for the scop
 1. Find the titles of the conversations to leave out. The dry run of way A shows them as `excluded "<title>"`:
 
 ```bash
-npm start -- transfer --from <source> --to <target> --mode copy --all --exclude <id-1> --exclude <id-2> --dry-run
+npm start -- transfer --from <source> --to <target> --all --exclude <id-1> --exclude <id-2> --dry-run
 ```
 
 2. Start the TUI:
@@ -159,19 +159,18 @@ npm start
    - Space or Tab selects and unselects a conversation
    - typing filters the list by title, Backspace removes the filter text
 8. Press Enter.
-9. In "Operation", choose "Copy (sync)".
-10. Read the "Plan" box.
+9. Read the "Plan" box.
 
-    Expected: one `[dry-run] created "..."` line for every chosen conversation (for SSH conversations followed by `transcript also on <host>`).
+    Expected: one `[n/N] [dry-run] created "..."` line for every chosen conversation (for SSH conversations followed by `transcript also on <host>`).
 
-11. Answer Yes to "Apply N operations?".
+10. Answer Yes to "Apply N operations?".
 
-    Expected: a "Result" box with a `created` line for every conversation.
+    Expected: a "Result" box with a `created` line for every conversation. While the run goes, the spinner says which conversation it is at (`Transferring 3/31 "..."`).
 
-12. Choose "Quit".
-13. Start the Claude app, switch to the target account and check the Code tab.
+11. Choose "Quit".
+12. Start the Claude app, switch to the target account and check the Code tab.
 
-Two things can stop the screen at one conversation on the way: a conversation whose copy on the target is newer or diverged gets a question before the plan (step 10), and a conversation that fails during the run gets one then. Both are described under "Questions that stop at one conversation".
+Two things can stop the screen at one conversation on the way: a conversation the target account already holds gets a question before the plan (step 9), saying whether the two are the same or different and which one is longer, and a conversation that fails during the run gets one then. Both are described under "Questions that stop at one conversation". On a first copy to an empty account there is nothing to ask about; on the next run every conversation copied before gets the question, and one answer can cover all of its kind.
 
 ### When something goes wrong
 
@@ -197,7 +196,7 @@ Two things can stop the screen at one conversation on the way: a conversation wh
 - Running the same command again is safe: copied conversations report "up to date" and nothing is duplicated. Copies made before 2026-09-28 get repaired on the way (`repaired`).
 - Do not delete `data/lineage.json`: it is how the tool knows what it has copied already.
 - Copies of SSH conversations are full conversations: you can continue them on the target account, on the same host. From the moment of copying, the original and the copy are independent.
-- Copied and moved conversations have Remote Control switched off; you switch it on in the app, per conversation.
+- Copied conversations have Remote Control switched off; you switch it on in the app, per conversation.
 - A copy carries the conversation's checkpoints (`/rewind` works in it) and its Remote Control attachments, on this Mac and on the SSH host.
 - Only one ccas writes at a time: the TUI, `transfer`, `restore` and `resolve` take a lock on `data/`; a dry run and the read-only commands do not.
 
@@ -210,7 +209,7 @@ npm start
 ```
 
 1. The start screen shows the directories in use and whether the app and `claude` processes run (for information). While Claude Code runs, every screen works up to the plan (a dry run), and applying is refused at the moment of writing. `npm start -- --dry-run` forces plans only, also with the app quit.
-2. "Transfer conversations": choose the source (an account or "No account"), the target account and the scope ("All N conversations", "All except the ones I pick" or "Pick them one by one"). For the last two, pick conversations from a list with a filter; the hint column shows the state against the target, the origin, the project, the date and the size. Then choose the operation (Copy or Move), decide for conversations in the "target is newer" and "diverged" states (one question each, see below), read the plan (a dry run, which reads the host for SSH conversations) and confirm. During the run a conversation that fails stops the run with a question (see below).
+2. "Transfer conversations": choose the source (an account or "No account"), the target account and the scope ("All N conversations", "All except the ones I pick" or "Pick them one by one"). For the last two, pick conversations from a list with a filter; the hint column shows the state against the target (with the comparison, for example `update available (target lacks 3 lines)`), the origin, the project, the date and the size. Then answer one question for every conversation the target already holds (the pair question, see below), read the plan (a dry run, which reads the host for SSH conversations) and confirm. The spinners count the conversations (`Planning 3/31 "..."`, `Transferring 3/31 "..."`), and every line of the Plan and Result boxes carries its number. During the run a conversation that fails stops the run with a question (see below).
 3. "Accounts": the table of accounts, giving an account a name, and typing an e-mail by hand, only for an account whose address was not found.
 4. "Restore from journal": undo a chosen operation.
 
@@ -218,15 +217,15 @@ After every operation that writes, start the Claude app again: it reads the reco
 
 #### Questions that stop at one conversation
 
-Three questions stop at one item of a batch. Each offers, besides the answers for that one item, the same answer for every item left and calling the whole thing off. Those two kinds of answer are confirmed a second time, after a note that says exactly what will happen: which conversations are affected, what stays as it is, what is undone. "No" at the confirmation (also Enter alone, and Ctrl+C there) returns to the question with every answer still open.
+Three questions stop at one item of a batch. Each offers, besides the answers for that one item, the same answer for every item left (of the same kind, for the pair question) and calling the whole thing off. Those two kinds of answer are confirmed a second time, after a note that says exactly what will happen: which conversations are affected (the first ten by name, then how many more), what stays as it is, what is undone. "No" at the confirmation (also Enter alone, and Ctrl+C there) returns to the question with every answer still open. Every question names the position of the conversation in the run: `[7/31] "<title>" ...`.
 
 | Question | When | For this one | For all that are left | Calling it off |
 |---|---|---|---|---|
-| `"<title>": target is newer (...). What to do?` (also `diverged`) | before the plan, once per conversation whose copy on the target is newer or diverged | "Skip this conversation": the target copy stays, the result lists it as skipped. "Overwrite the target copy": the previous copy goes into backups | "Skip all N remaining conflicts", "Overwrite all N remaining conflicts": this one and the ones after it; the note lists them, and answers already given stay as given | "Cancel the transfer": nothing has been written at this point (files change only after "Apply N operations?"), the choices are discarded, back to the menu. Ctrl+C at the question does the same without asking |
-| `"<title>" failed. What now?` (or `was refused`) | during the run, after a conversation failed or the guard refused it (Claude Code appeared), while other conversations are still to come | "Skip it and continue": the next conversation is tried (after a refusal, quit Claude Code first; the guard is asked again before each one). "Stop here": what was done stays, the rest is not attempted; Ctrl+C does the same | "Continue without asking again": later failures and refusals only show in the Result box | "Cancel the transfer and undo what it did": the operations of this run are undone newest first, each undo a restore entry of its own; the note lists them with their journal ids. Claude Code must still be closed: an undo it refuses, and the ones after it, stay listed in "Restore from journal" |
+| the pair question, `[n/N] "<title>" is the same on both accounts (12 lines each). What to do?` or `... differs: the source is longer (source 20 lines, target 12)`, `... differs: the target is longer (...)`, `... differs: both went on after 10 lines shared (...; the source is longer)` | before the plan, once per conversation the target account already holds a linked copy of (see "Conversations and their copies"); the lines are the transcript lines the comparison counts | the same: "Skip this conversation" (nothing is done, the SSH host is not asked, the result lists it as skipped), "Keep it as it is (up to date)" (as before: a copy made before 2026-09-28 is repaired, which looks at the SSH host) or "Copy anyway: overwrite the target copy" (the transcript is the same, the record is refreshed: title, archive state). The source longer: "Copy: bring the target copy up to date" or "Skip this conversation". The target longer, or diverged: "Skip this conversation" or "Overwrite the target copy". The first answer of each is the one Enter takes | "Skip all N remaining identical conversations", "Keep all ...", "Copy all ... anyway"; "Copy all N remaining where the source is longer", "Skip all ..."; "Skip all N remaining where the target is longer", "Overwrite all ..."; "Skip all N remaining diverged conversations", "Overwrite all ...": this one and the ones of the same kind after it, so skipping every identical pair leaves the others still asked about; the note lists them, and answers already given stay as given | "Cancel the transfer": nothing has been written at this point (files change only after "Apply N operations?"), the choices are discarded, back to the menu. Ctrl+C at the question does the same without asking |
+| `[n/N] "<title>" failed. What now?` (or `was refused`) | during the run, after a conversation failed or the guard refused it (Claude Code appeared), while other conversations are still to come | "Skip it and continue": the next conversation is tried (after a refusal, quit Claude Code first; the guard is asked again before each one). "Stop here": what was done stays, the rest is not attempted; Ctrl+C does the same | "Continue without asking again": later failures and refusals only show in the Result box | "Cancel the transfer and undo what it did": the operations of this run are undone newest first, each undo a restore entry of its own; the note lists them with their journal ids. Claude Code must still be closed: an undo it refuses, and the ones after it, stay listed in "Restore from journal" |
 | `What should happen to it?` (an interrupted operation) | before anything writes, once per operation an earlier run left interrupted (see "Interrupted operations") | "Undo": restore it. "Leave": mark it resolved, its files stay | "Undo all N remaining", "Leave all N remaining" | "Exit": the note says what was undone so far (that stays undone: a finished restore is final), what was left, and what stays interrupted and is asked about again before the next write; exit code 4 at start-up, back to the menu inside a screen |
 
-The last conversation of a run failing asks nothing: the run is over, and "Restore from journal" undoes any single operation. The result box and the summary count a conversation skipped at the failure question as failed, since it was. The command mode does not stop at a failure (its result lines and exit code 3 report it) and answers every conflict the same way with `--on-conflict`.
+A conversation the target does not hold yet, a record without a transcript, a linked copy that holds another conversation and a conversation linked to several copies are not asked about: there is nothing to compare, or the copy is never touched (see "States"). The last conversation of a run failing asks nothing: the run is over, and "Restore from journal" undoes any single operation. The result box and the summary count a conversation skipped at the failure question as failed, since it was. The command mode asks nothing: it does not stop at a failure (its result lines and exit code 3 report it), finds identical copies up to date, updates copies that are behind, and answers every newer or diverged copy the same way with `--on-conflict`.
 
 ### Command mode
 
@@ -235,8 +234,8 @@ The last conversation of a run failing asks nothing: the run is over, and "Resto
 | `npm start -- --dry-run` | the TUI in rehearsal mode: every screen shows its plan and writes nothing |
 | `npm start -- accounts [--json]` | accounts, e-mails, names |
 | `npm start -- list --from <account\|none> [--to <account>] [--json]` | the conversations of the source; with `--to` also their state against the target |
-| `npm start -- transfer --from <account\|none> --to <account> --mode copy\|move --session <id> [--session <id> ...] [--on-conflict skip\|overwrite] [--dry-run]` | runs the operation on the conversations named |
-| `npm start -- transfer --from <account\|none> --to <account> --mode copy\|move --all [--exclude <id> ...] [--on-conflict skip\|overwrite] [--dry-run]` | runs the operation on every conversation of the source except the excluded ones |
+| `npm start -- transfer --from <account\|none> --to <account> --session <id> [--session <id> ...] [--on-conflict skip\|overwrite] [--dry-run]` | copies the conversations named |
+| `npm start -- transfer --from <account\|none> --to <account> --all [--exclude <id> ...] [--on-conflict skip\|overwrite] [--dry-run]` | copies every conversation of the source except the excluded ones |
 | `npm start -- journal [--json]` | the operation journal |
 | `npm start -- restore <journalId> [--dry-run]` | undoes an operation |
 | `npm start -- resolve <journalId>` | keeps the files of an interrupted operation as they are (see "Interrupted operations") |
@@ -245,13 +244,13 @@ An account is named by its name, its e-mail, the `accountId/orgId` pair, its acc
 
 `--all` takes every conversation of the source, and `--exclude` (repeatable) leaves out the ones named. Every `--exclude` must match exactly one conversation, by the same rules as `--session`. A typo or an ambiguous prefix ends with exit code 1 before anything is written. The same conversation named twice counts once. Nothing else is merged: two conversations are always two entries. `--all` together with `--session`, `--exclude` without `--all`, and neither of the two are usage errors.
 
-The output of `transfer` is, in order: the `excluded` lines, one result line per conversation, a reminder to start the app, and a summary at the end:
+The output of `transfer` is, in order: the `excluded` lines, one result line per conversation as it is done, each starting with its number in the run (`[3/31] created "..."`, in a dry run `[3/31] [dry-run] created "..."`), a reminder to start the app, and a summary at the end:
 
 ```
 summary: 31 created, 0 updated, 0 up to date, 0 skipped, 2 excluded, 0 failed
 ```
 
-The six counts always appear; `repaired`, `moved` and `refused` are added when there are any.
+The six counts always appear; `repaired` and `refused` are added when there are any. There is no `--mode`: the tool copies only (a command line that still says `--mode copy` ends with a usage error).
 
 Global options: `--user-data <dir>` (the app's data), `--claude-dir <dir>` (the CLI directory, by default `CLAUDE_CONFIG_DIR` or `~/.claude`), `--data <dir>` (the tool's data, by default `data/` in this directory). With `--user-data` pointing at a copy of the app's directory you can rehearse operations safely: the block while Claude Code runs applies only to the real directory.
 
@@ -293,7 +292,7 @@ Conversations driven from claude.ai through Remote Control, and sessions started
 
 Every entry in the app's side panel is a conversation of its own, and the tool does not judge conversations: it does not check whether they are the same, similar, short, unfinished or odd. A conversation on the source and one on the target account count as an original and its copy only when an explicit link connects them:
 
-1. they have the same record id (a record moved between accounts)
+1. they have the same record id (a record moved between accounts by hand, or by a version of this tool from before 2026-10-07, which could move conversations)
 2. `data/lineage.json` recorded a link between them, in either direction (a transcript without a record is named there by its `cliSessionId`)
 3. the `ccas` stamp of one record names the other
 
@@ -301,15 +300,16 @@ In every other case the conversation is new on the target account, even when it 
 
 Content is compared only for a linked pair. Every message line of a transcript has a `uuid`, and a copy changes only the session id, so the ordered list of uuids tells whether the copy is up to date, behind, ahead of the source, or diverged.
 
-### Copy (sync), Move, Import
+### Copy (sync), Import
 
 | Operation | The target account has no copy | The target account has a linked copy |
 |---|---|---|
-| Copy (sync) | a copy is made with a new `sessionId` and a new `cliSessionId`, its own transcript, sidecar directory and per-session directories (for SSH: its own mirror, and its own transcript and per-session directories on the host) | the copy is brought up to date with the source (transcript, sidecar directory, per-session directories, record); the target keeps its ids |
-| Move | the record file changes directory; ids and transcript stay as they are | as above, then the record, transcript, sidecar directory and per-session directories of the source go into the backup |
+| Copy (sync) | a copy is made with a new `sessionId` and a new `cliSessionId`, its own transcript, sidecar directory and per-session directories (for SSH: its own mirror, and its own transcript and per-session directories on the host) | the copy is brought up to date with the source (transcript, sidecar directory, per-session directories, record); the target keeps its ids. In the TUI the pair question decides whether that happens (see "States") |
 | Import (source "No account") | like Copy; the original transcript is not touched | like Copy |
 
-Every operation switches Remote Control off in the conversation it transfers (see "Remote Control").
+The source is never changed. Until 2026-10-07 the tool could also move a conversation (the record changed accounts with its ids, the source's files went into the backup); that path was removed. Journal entries and lineage links of mode `move` from before still load, and `restore` undoes such an entry like any other.
+
+Every operation switches Remote Control off in the conversation it copies (see "Remote Control").
 
 Copies get new ids on purpose: when it switches accounts, the app parks sessions by `sessionId`, so one id on two accounts could send a write to the directory of the wrong account.
 
@@ -352,13 +352,13 @@ Before an operation the tool finds out whether the target account has a linked c
 | State | Meaning | What the tool does |
 |---|---|---|
 | new on target | the target has no linked copy | makes a copy |
-| up to date | the uuid lists are identical | nothing, except repairing a copy made before 2026-09-28 (see "Repairing older copies"); Move then removes the source |
-| update available | the copy is a prefix of the source, or it has no transcript (for example the app removed its `cliSessionId`) | updates the target |
-| target is newer | the source is a prefix of the copy | skips; with "overwrite" chosen, overwrites the target |
-| diverged | a common start, then both sides added lines | skips; with "overwrite" chosen, overwrites the target |
-| linked copy holds another conversation | the linked copy has different content now, for example the app started a new session in it | skips, never overwrites |
-| linked to several on target | several entries on the target are linked to the conversation | skips and prints their ids |
-| no transcript | a record without a transcript file | Copy makes a copy of the record alone (when there is one already: "up to date", or a repair); Move moves the record alone |
+| up to date | the uuid lists are identical | command mode: nothing, except repairing a copy made before 2026-09-28 (see "Repairing older copies"). TUI, the pair question ("the same on both accounts"): skip (nothing, not even the host probe of the repair; listed as skipped), keep (as the command mode) or copy anyway (the copy is written again: the same transcript, the record refreshed) |
+| update available | the copy is a prefix of the source, or it has no transcript (for example the app removed its `cliSessionId`) | command mode: updates the target. TUI ("the source is longer"): copy (updates the target) or skip |
+| target is newer | the source is a prefix of the copy | skips; with "overwrite" chosen (`--on-conflict overwrite`, or the TUI's answer for "the target is longer"), overwrites the target |
+| diverged | a common start, then both sides added lines | skips; with "overwrite" chosen (`--on-conflict overwrite`, or the TUI's answer for "diverged"), overwrites the target |
+| linked copy holds another conversation | the linked copy has different content now, for example the app started a new session in it | skips, never overwrites; the TUI does not ask |
+| linked to several on target | several entries on the target are linked to the conversation | skips and prints their ids; the TUI does not ask |
+| no transcript | a record without a transcript file | makes a copy of the record alone (when there is one already: "up to date", or a repair); the TUI does not ask, there is nothing to compare |
 
 For a linked pair the project directory, the record's creation time and the time of the first line are compared as well; a mismatch is shown as a warning.
 
@@ -398,7 +398,7 @@ Checked against the real CLI 2.1.281 on a host: for a random id, `--resume` fail
 
 ### Remote Control
 
-A conversation driven or followed from claude.ai (Remote Control) is linked to a claude.ai session of the account it ran under. Copying and moving switch that link off, because the claude.ai session belongs to the source account:
+A conversation driven or followed from claude.ai (Remote Control) is linked to a claude.ai session of the account it ran under. Copying switches that link off in the copy, because the claude.ai session belongs to the source account:
 
 | Where | What changes |
 |---|---|
@@ -407,7 +407,7 @@ A conversation driven or followed from claude.ai (Remote Control) is linked to a
 
 The app then does not switch Remote Control on by itself. You can switch it on in the app, and the conversation is linked to a new claude.ai session of the account it is on now.
 
-Transcripts of SSH conversations get that line on the host (the mirror picks it up), because the local mirror must stay a prefix of the host file. When an SSH conversation is moved and the host cannot be reached, you get a warning: the record has Remote Control off, and the transcript line matters only once it is switched on again. A CLI process that still runs on the host keeps its link until it ends.
+Transcripts of SSH conversations get that line on the host (the mirror picks it up), because the local mirror must stay a prefix of the host file. A CLI process that still runs on the host keeps its link until it ends.
 
 `restore` brings the record back from the backup, and with it the earlier Remote Control state. The lines added to a transcript on the host stay (the output of `restore` warns about that).
 
@@ -443,14 +443,14 @@ Flags: `archived`, `no transcript`, `adopted`. The tool does not guess whether a
 The app does not store the e-mail next to the account directory. The tool finds it from three sources, in this order:
 
 1. `~/.claude.json`, the `oauthAccount` block (account uuid, organization uuid, e-mail, organization name), for the account the CLI is signed in to. Only these four fields are read from that file. The organization name tells apart two directories of the same e-mail in two organizations.
-2. `session_context` lines in the transcripts of the account's sessions (newer CLI versions write the user's e-mail there). Sessions that belong to another account according to their `bridge-session` lines do not vote. Neither do lines from before a copy or a move to this account.
+2. `session_context` lines in the transcripts of the account's sessions (newer CLI versions write the user's e-mail there). Sessions that belong to another account according to their `bridge-session` lines do not vote. Neither do lines from before a copy to this account (or a move by an earlier version of this tool).
 3. The value remembered in `data/accounts.json` from earlier runs.
 
 When no source knows the address, the TUI lets you type it. Every account can get a name of your own, shown instead of the e-mail.
 
 ### The stamp on records
 
-Every record the tool creates, updates or moves gets a `ccas` field that says where it came from and how many lines the source transcript had at that moment. The app drops that field the first time it saves the record, because it writes only the fields it knows, so the stamp is only a hint until then. The lasting record of where copies came from is `data/lineage.json`: it tells the tool which conversation is a copy of which, and it keeps e-mails from inherited `session_context` lines from counting as evidence for the target account. Moves write a link there as well (the record keeps its id, so the link only marks the line count of the move): without it, a moved conversation whose stamp the app had dropped made the source account's e-mail vote for the target account.
+Every record the tool creates or updates gets a `ccas` field that says where it came from and how many lines the source transcript had at that moment. The app drops that field the first time it saves the record, because it writes only the fields it knows, so the stamp is only a hint until then. The lasting record of where copies came from is `data/lineage.json`: it tells the tool which conversation is a copy of which, and it keeps e-mails from inherited `session_context` lines from counting as evidence for the target account. Links of mode `move`, written by versions from before 2026-10-07 (the record kept its id, so such a link only marks the line count of the move), are still read for the same purpose: without them, a moved conversation whose stamp the app had dropped made the source account's e-mail vote for the target account.
 
 ## Interrupted operations
 
@@ -498,7 +498,7 @@ Without a terminal (a script, a pipe) the tool does not ask: it ends with exit c
 |---|---|
 | `accounts.json` | accounts: uuid, e-mail and where it came from, organization name, your own name |
 | `lineage.json` | links between copies (what from where, and when); the tool knows from it which conversation is a copy of which, so do not delete or edit it by hand; a damaged file stops the tool with an error |
-| `journal.jsonl` | the operation journal |
+| `journal.jsonl` | the operation journal (entries of mode `move`, from versions before 2026-10-07, still list and restore) |
 | `summary-cache.json` | transcript summaries, so later runs do not read hundreds of megabytes again |
 | `backups/` | backups, one directory per operation |
 | `lock` | the pid of the ccas that is writing right now; removed when it finishes |
@@ -511,7 +511,6 @@ The directory is in `.gitignore`.
 - A conversation driven from claude.ai has metadata on the server side. An import makes an independent desktop copy; the claude.ai session and its transcript are not touched.
 - The account's `scheduled-tasks.json` is not modified; when it refers to a transferred session, you get a warning.
 - Copying an SSH conversation needs `ssh` access to the host, without a prompt, at the time of copying (see "SSH sessions"). An SSH transcript without a record (an import from "No account") has no host recorded, so its copy gets no transcript on the host and is for reading only.
-- Moving an SSH conversation does not remove its transcript from the host; the backup covers only the files on this Mac.
 - Links are direct: a copy of a copy (A -> B -> C) is not linked to the original on account A.
 - An imported transcript of a terminal session is subject to the CLI's cleanup: Claude Code deletes transcripts older than `cleanupPeriodDays` (30 days by default) unless the session was started or last continued in the desktop app, so a copy that is never opened in the app can disappear after a month, leaving its record without a transcript.
 - The app itself looks for desktop transcripts that lost their record and offers to adopt them. After an import from "No account" the original is still such a transcript, so the app may adopt it on the account that ran it; the copy and the adopted original are then two conversations.
@@ -549,11 +548,12 @@ Modules in `src/`:
 | `compare.ts` | how two uuid lists relate, consistency checks |
 | `accounts.ts` | finding accounts, sources of the e-mail, `accounts.json` |
 | `inventory.ts` | the full picture: conversations per account, transcripts without a record, links between copies, the state against a target |
-| `operations.ts` | Copy, Move, Import, Restore, repairing older copies |
+| `operations.ts` | Copy, Import, Restore, repairing older copies, and the policy for a copy the target already holds (`ExistingPolicy`: what the command line's `--on-conflict` and the TUI's pair question stand for) |
 | `operation-log.ts` | the journal entry and backups of one operation, written ahead of each step |
 | `batch.ts` | undoing the operations of one run as a whole, newest first (the "cancel the transfer" answer of the failure question) |
 | `interrupted.ts`, `tui/interrupted.ts` | interrupted operations: description, instructions, the question (with "all" answers and a confirmed Exit) |
 | `tui/decide.ts` | a question about one item of a batch whose answers can reach the rest of it, each such answer confirmed after a note |
+| `tui/transfer.ts` | the transfer screen: the pair question (the four kinds of pair, their answers, the capped notes), the failure question, the counted spinners, the plan and the run |
 | `journal.ts`, `lineage.ts`, `summary-cache.ts` | the tool's state |
 | `app-guard.ts` | detecting a running app and CLI processes, through the process list and the CLI's session index |
 | `lock.ts` | one writing ccas at a time per data directory |

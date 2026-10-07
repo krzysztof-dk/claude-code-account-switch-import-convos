@@ -277,26 +277,59 @@ describe('tui through a pipe', { concurrency: false }, () => {
     await t.answer('Target account', KEY.enter);
     await t.answer('Which conversations to transfer to', KEY.enter);
     assert.ok(t.output().includes('All 2 conversations'), t.recent());
-    await t.answer('Copy (sync)', KEY.enter);
+    // Nothing on B yet, so no pair question: the plan comes next, every line counted.
     await t.waitFor('Plan');
     // The confirmation is a clack confirm: "y" answers it at once.
     await t.answer('Apply 2 operations?', 'y');
     const plan = t.output();
     assert.equal(plan.split('[dry-run] created "').length - 1, 2, plan);
+    for (const at of ['[1/2] [dry-run] created "', '[2/2] [dry-run] created "']) assert.ok(plan.includes(at), `${at} in:\n${plan}`);
     await t.waitFor('Result');
     await t.waitFor('Start the Claude app to see the result');
     // The two fixtures have the same last activity, so their order in the box is not fixed.
     const result = t.flat().slice(t.flat().lastIndexOf('Result'));
     for (const title of ['first chat', 'second chat']) {
-      assert.match(result, new RegExp(`created "${title}" on bbbbbbbb\\.\\.\\. as local_\\S+ \\[journal \\S+\\]`), result);
+      assert.match(result, new RegExp(`\\[[12]/2\\] created "${title}" on bbbbbbbb\\.\\.\\. as local_\\S+ \\[journal \\S+\\]`), result);
     }
+    assert.ok(t.flat().includes('Planned 2 conversations'), t.flat());
+    assert.ok(t.flat().includes('Done, 2 conversations'), t.flat());
     await t.quit();
     assert.equal((await localRecords(world.b.dir)).length, 2);
   });
 
+  it('(m) asks about every identical pair, and "Skip all" plans and reports them as skipped without writing', { timeout: 30_000 }, async () => {
+    // Right after (c): both conversations have an identical copy on B.
+    assert.equal((await localRecords(world.b.dir)).length, 2);
+    const journal = path.join(world.paths.dataDir, 'journal.jsonl');
+    const entriesBefore = (await readLines(journal)).length;
+    const t = open();
+    await t.answer('What next?', KEY.enter);
+    await t.answer('Source', KEY.enter);
+    await t.answer('Target account', KEY.enter);
+    await t.answer('Which conversations to transfer to', KEY.enter);
+    assert.ok(t.recent().includes('2 up to date'), t.recent());
+    await t.waitFor('is the same on both accounts');
+    assert.match(t.flat(), /\[1\/2\] "(first|second) chat" is the same on both accounts \(\d+ lines each\)\. What to do\?/, t.flat());
+    // Skip, Keep, Copy anyway, Skip all, Keep all, Copy all anyway, Cancel: the fourth.
+    t.child.stdin.write(KEY.down + KEY.down + KEY.down + KEY.enter);
+    await t.waitFor('Skipped: nothing is done to any of them');
+    // The question (printed as the prompt and again with its answer) and the two pairs the note lists.
+    assert.equal(t.flat().split('is the same on both accounts').length - 1, 4, `the question twice and the two listed pairs:\n${t.flat()}`);
+    await t.answer('Skip all 2 remaining identical conversations?', 'y');
+    await t.waitFor('Plan');
+    assert.ok(!t.output().includes('[2/2] "'), 'the second pair was not asked about');
+    assert.equal(t.flat().split('[dry-run] skipped "').length - 1, 2, t.flat());
+    await t.answer('Apply 2 operations?', 'y');
+    await t.waitFor('Result');
+    const result = t.flat().slice(t.flat().lastIndexOf('Result'));
+    for (const title of ['first chat', 'second chat']) assert.ok(result.includes(`skipped "${title}": the target copy is identical; left as answered`), result);
+    await t.quit();
+    assert.equal((await readLines(journal)).length, entriesBefore, 'skipping writes nothing');
+  });
+
   it('(d) restores operations from the journal, newest first, until B is empty again', { timeout: 20_000 }, async () => {
     // Makes the copies itself when (c) did not; after (c) this only reports them up to date.
-    const copied = await runCli(world, 'transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--mode', 'copy', '--all');
+    const copied = await runCli(world, 'transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--all');
     assert.equal(copied.code, 0, copied.stderr);
     assert.equal((await localRecords(world.b.dir)).length, 2);
     const t = open();
@@ -360,7 +393,6 @@ describe('tui through a pipe', { concurrency: false }, () => {
     await t.answer('Source', KEY.enter);
     await t.answer('Target account', KEY.enter);
     await t.answer('Which conversations to transfer to', KEY.enter);
-    await t.answer('Copy (sync)', KEY.enter);
     await t.waitFor('Plan');
     await t.waitFor('Dry run: nothing was changed');
     assert.equal(t.output().split('[dry-run] created "').length - 1, 2);
@@ -383,7 +415,7 @@ describe('tui through a pipe', { concurrency: false }, () => {
     await t.waitFor('What next?');
     const lock = path.join(world.paths.dataDir, LOCK_FILE_NAME);
     assert.equal((await readJson<{ pid: number }>(lock)).pid, t.child.pid);
-    const second = await runCli(world, 'transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--mode', 'copy', '--all');
+    const second = await runCli(world, 'transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--all');
     assert.equal(second.code, 1);
     assert.match(second.stderr, new RegExp(`another ccas is running \\(PID ${t.child.pid},`));
     assert.deepEqual(await localRecords(world.b.dir), [], 'the refused transfer wrote nothing');
@@ -391,10 +423,10 @@ describe('tui through a pipe', { concurrency: false }, () => {
     assert.equal(await pathExists(lock), false, 'released when the TUI ended');
   });
 
-  /** Appends one round to the transcript of every copy on B, so each pair reads "target is newer" on the next transfer. */
-  async function growCopiesOnB(startAt: number): Promise<void> {
-    for (const name of await localRecords(world.b.dir)) {
-      const record = await readJson<{ cliSessionId?: string; cwd: string }>(path.join(world.b.dir, name));
+  /** Appends one round to the transcript of every record in `dir` (an account's records): on B each pair then reads "target is longer", on A "source is longer". */
+  async function growRecordsIn(dir: string, startAt: number): Promise<void> {
+    for (const name of await localRecords(dir)) {
+      const record = await readJson<{ cliSessionId?: string; cwd: string }>(path.join(dir, name));
       assert.ok(record.cliSessionId, `${name} names its transcript`);
       const projectDir = path.join(world.paths.projectsRoot, encodeCwd(record.cwd));
       const transcript = { cliId: record.cliSessionId, path: path.join(projectDir, `${record.cliSessionId}.jsonl`), projectDir, sidecarDir: '', cwd: record.cwd, lines: [], uuids: [] };
@@ -402,49 +434,51 @@ describe('tui through a pipe', { concurrency: false }, () => {
     }
   }
 
-  /** Walks the transfer screen up to the first conflict question: source A, target B, all conversations, Copy. */
-  async function reachConflictQuestion(t: Tui): Promise<void> {
+  /** Walks the transfer screen up to the first pair question: source A, target B, all conversations. */
+  async function reachPairQuestion(t: Tui, stateHint: string): Promise<void> {
     await t.answer('What next?', KEY.enter);
     await t.answer('Source', KEY.enter);
     await t.answer('Target account', KEY.enter);
     await t.answer('Which conversations to transfer to', KEY.enter);
-    assert.ok(t.recent().includes('2 target is newer'), t.recent());
-    await t.answer('Copy (sync)', KEY.enter);
+    assert.ok(t.recent().includes(stateHint), t.recent());
     await t.waitFor('What to do?');
   }
 
-  it('(i) answers one conflict question for every conflict left, after a note and a confirmation', { timeout: 30_000 }, async () => {
-    const copied = await runCli(world, 'transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--mode', 'copy', '--all');
+  it('(i) answers one question for every pair of the same kind left, after a note and a confirmation', { timeout: 30_000 }, async () => {
+    const copied = await runCli(world, 'transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--all');
     assert.equal(copied.code, 0, copied.stderr);
-    await growCopiesOnB(Date.UTC(2026, 8, 5));
+    await growRecordsIn(world.b.dir, Date.UTC(2026, 8, 5));
     const t = open();
-    await reachConflictQuestion(t);
+    await reachPairQuestion(t, '2 target is newer');
+    assert.match(t.flat(), /\[1\/2\] "(first|second) chat" differs: the target is longer \(source \d+ lines, target \d+\)\. What to do\?/, t.flat());
     // Skip, Overwrite, Skip all, Overwrite all, Cancel: the fourth.
     t.child.stdin.write(KEY.down + KEY.down + KEY.down + KEY.enter);
-    await t.waitFor('Overwritten: each target copy is replaced by the source.');
-    assert.equal(t.flat().split('(target is newer: target has 4 extra lines)').length - 1, 2, `the note lists both:\n${t.flat()}`);
-    await t.answer('Overwrite the target copies of all 2 remaining conflicts?', 'y');
+    await t.waitFor('Overwritten: each target copy is replaced by its shorter source.');
+    // The question (printed as the prompt and again with its answer) and the two pairs the note lists.
+    assert.equal(t.flat().split('differs: the target is longer').length - 1, 4, `the question twice and the two listed pairs:\n${t.flat()}`);
+    await t.answer('Overwrite the target copies of all 2 remaining where the target is longer?', 'y');
     await t.waitFor('Plan');
-    const asked = ['first chat', 'second chat'].filter((title) => t.output().includes(`"${title}": target is newer`));
-    assert.equal(asked.length, 1, `only the first conflict was asked about: ${asked.join(', ')}`);
+    // The question carries its position; the note lists pairs without one.
+    const asked = ['first chat', 'second chat'].filter((title) => t.output().includes(`/2] "${title}" differs`));
+    assert.equal(asked.length, 1, `only the first pair was asked about: ${asked.join(', ')}`);
     assert.equal(t.output().split('[dry-run] updated "').length - 1, 2, t.output());
     await t.answer('Apply 2 operations?', 'y');
     await t.waitFor('Result');
     const result = t.flat().slice(t.flat().lastIndexOf('Result'));
-    for (const title of ['first chat', 'second chat']) assert.match(result, new RegExp(`updated "${title}" on bbbbbbbb`), result);
+    for (const title of ['first chat', 'second chat']) assert.match(result, new RegExp(`\\[[12]/2\\] updated "${title}" on bbbbbbbb`), result);
     await t.quit();
   });
 
   it('(j) declines a batch answer, then cancels the transfer after the note, with nothing written', { timeout: 30_000 }, async () => {
-    await growCopiesOnB(Date.UTC(2026, 8, 7));
+    await growRecordsIn(world.b.dir, Date.UTC(2026, 8, 7));
     const journal = path.join(world.paths.dataDir, 'journal.jsonl');
     const entriesBefore = (await readLines(journal)).length;
     const t = open();
-    await reachConflictQuestion(t);
+    await reachPairQuestion(t, '2 target is newer');
     // Skip all (the third answer), declined at its confirmation.
     t.child.stdin.write(KEY.down + KEY.down + KEY.enter);
     await t.waitFor('Skipped: the target copy of each stays as it is');
-    await t.answer('Skip all 2 remaining conflicts?', 'n');
+    await t.answer('Skip all 2 remaining where the target is longer?', 'n');
     // The same question again; Cancel is the last answer.
     await t.answer('What to do?', KEY.up + KEY.enter);
     await t.waitFor('Nothing has been written: these questions come before the plan');
@@ -452,6 +486,30 @@ describe('tui through a pipe', { concurrency: false }, () => {
     await t.waitFor('Transfer cancelled: nothing was changed.');
     await t.quit();
     assert.equal((await readLines(journal)).length, entriesBefore, 'no operation ran');
+  });
+
+  it('(n) where the source is longer, "Copy all" brings every copy up to date', { timeout: 30_000 }, async () => {
+    // Back to identical pairs first, then the sources grow.
+    const overwritten = await runCli(world, 'transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--all', '--on-conflict', 'overwrite');
+    assert.equal(overwritten.code, 0, overwritten.stderr);
+    assert.match(overwritten.stdout, /summary: 0 created, 2 updated/);
+    await growRecordsIn(world.a.dir, Date.UTC(2026, 8, 8));
+    const t = open();
+    await reachPairQuestion(t, '2 update available');
+    assert.match(t.flat(), /\[1\/2\] "(first|second) chat" differs: the source is longer \(source \d+ lines, target \d+\)\. What to do\?/, t.flat());
+    // Copy, Skip, Copy all, Skip all, Cancel: the third.
+    t.child.stdin.write(KEY.down + KEY.down + KEY.enter);
+    await t.waitFor('Updated: each target copy is brought up to date with its source.');
+    await t.answer('Copy all 2 remaining where the source is longer?', 'y');
+    await t.waitFor('Plan');
+    assert.equal(t.output().split('[dry-run] updated "').length - 1, 2, t.output());
+    await t.answer('Apply 2 operations?', 'y');
+    await t.waitFor('Result');
+    const result = t.flat().slice(t.flat().lastIndexOf('Result'));
+    for (const title of ['first chat', 'second chat']) assert.match(result, new RegExp(`updated "${title}" on bbbbbbbb`), result);
+    await t.quit();
+    const again = await runCli(world, 'transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--all', '--dry-run');
+    assert.match(again.stdout, /summary: 0 created, 0 updated, 2 up to date/);
   });
 
   describe('(k) a conversation fails during the run', { concurrency: false }, () => {
@@ -479,22 +537,34 @@ describe('tui through a pipe', { concurrency: false }, () => {
       await destroyWorld(own);
     });
 
-    /** Walks the transfer screen to the failure question: all of A to B as copies, the plan applied. */
-    async function reachFailureQuestion(t: Tui): Promise<void> {
+    /**
+     * Walks the transfer screen to the failure question: all of A to B, the
+     * plan applied. Once B holds copies (after (k2)), the two good chats are
+     * identical pairs and the pair question comes first; "Keep all" answers
+     * it the way the run went before the question existed (up to date).
+     */
+    async function reachFailureQuestion(t: Tui, copiesOnB: boolean): Promise<void> {
       await t.answer('What next?', KEY.enter);
       await t.answer('Source', KEY.enter);
       await t.answer('Target account', KEY.enter);
       await t.answer('Which conversations to transfer to', KEY.enter);
-      await t.answer('Copy (sync)', KEY.enter);
+      if (copiesOnB) {
+        await t.waitFor('[1/3] "good chat" is the same on both accounts');
+        // Skip, Keep, Copy anyway, Skip all, Keep all, Copy all anyway, Cancel: the fifth.
+        t.child.stdin.write(KEY.down + KEY.down + KEY.down + KEY.down + KEY.enter);
+        await t.waitFor('Kept: nothing is copied');
+        await t.answer('Keep all 2 remaining identical conversations?', 'y');
+      }
       await t.waitFor('Plan');
-      assert.ok(t.flat().includes('[dry-run] FAILED "ssh chat"'), t.flat());
+      assert.ok(t.flat().includes('[2/3] [dry-run] FAILED "ssh chat"'), t.flat());
       await t.answer('Apply 3 operations?', 'y');
-      await t.waitFor('"ssh chat" failed. What now?');
+      await t.waitFor('[2/3] "ssh chat" failed. What now?');
     }
 
     it('(k1) stops at the failed conversation and undoes what the run did when the transfer is cancelled', { timeout: 30_000 }, async () => {
       const t = openOwn();
-      await reachFailureQuestion(t);
+      await reachFailureQuestion(t, false);
+      assert.ok(t.flat().includes('Stopped at 2/3 "ssh chat"'), t.flat());
       // Skip, Continue without asking, Stop, Cancel and undo: the last.
       t.child.stdin.write(KEY.up + KEY.enter);
       await t.waitFor('Undone, newest first');
@@ -517,18 +587,18 @@ describe('tui through a pipe', { concurrency: false }, () => {
 
     it('(k2) skips the failed conversation and goes on with the next', { timeout: 30_000 }, async () => {
       const t = openOwn();
-      await reachFailureQuestion(t);
+      await reachFailureQuestion(t, false);
       t.child.stdin.write(KEY.enter);
       await t.waitFor('Result');
       const result = t.flat().slice(t.flat().lastIndexOf('Result'));
-      for (const expected of ['created "good chat" on bbbbbbbb', 'FAILED "ssh chat"', 'created "third chat" on bbbbbbbb']) assert.ok(result.includes(expected), `${expected} in:\n${result}`);
+      for (const expected of ['[1/3] created "good chat" on bbbbbbbb', '[2/3] FAILED "ssh chat"', '[3/3] created "third chat" on bbbbbbbb']) assert.ok(result.includes(expected), `${expected} in:\n${result}`);
       await t.quit();
       assert.equal((await localRecords(own.b.dir)).length, 2);
     });
 
     it('(k3) stops after the failed conversation, keeping what was done', { timeout: 30_000 }, async () => {
       const t = openOwn();
-      await reachFailureQuestion(t);
+      await reachFailureQuestion(t, true);
       // Stop here is the third answer.
       t.child.stdin.write(KEY.down + KEY.down + KEY.enter);
       await t.waitFor('Stopped; the 1 conversation left was not attempted.');
@@ -542,7 +612,7 @@ describe('tui through a pipe', { concurrency: false }, () => {
 
     it('(k4) goes on without asking again once that is confirmed, after declining it once', { timeout: 30_000 }, async () => {
       const t = openOwn();
-      await reachFailureQuestion(t);
+      await reachFailureQuestion(t, true);
       t.child.stdin.write(KEY.down + KEY.enter);
       // The first words of the note: a note is a box wrapped at 80 columns, so
       // a phrase from its middle may be split over two rows (see flat()).

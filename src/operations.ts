@@ -1,8 +1,9 @@
-// The writes: copying, moving and importing conversations, and undoing them.
+// The writes: copying and importing conversations, and undoing them.
 //
 // Every operation follows the same shape:
-//   1. decide what to do from the sync assessment (inventory.ts) and the mode;
-//      for a conversation on an SSH host, look at the host (read only)
+//   1. decide what to do from the sync assessment (inventory.ts) and the
+//      policy for an existing copy (ExistingPolicy); for a conversation on an
+//      SSH host, look at the host (read only)
 //   2. ask the guard (app-guard.ts) whether writing is allowed right now
 //   3. open a journal entry (status "running") so an interruption leaves a trail
 //   4. back up whatever will be overwritten, move whatever will be replaced
@@ -12,8 +13,7 @@
 //      side of an SSH conversation; ask the guard once more, record the
 //      lineage link, then write the record, the file the desktop app reads at
 //      start-up
-//   6. only then remove source files, and only by moving them into the backup dir
-//   7. close the journal entry (done / failed)
+//   6. close the journal entry (done / failed)
 // Nothing is ever deleted outright, and `restore <journalId>` walks the entry
 // backwards. A dry run stops after step 1 and reports what would happen. When
 // the guard closes during an operation (the app or a CLI session was started
@@ -21,10 +21,16 @@
 // "refused"; when a host step fails, it rolls back the same way and reports
 // "failed".
 //
+// The source is never touched: the tool copies only. Until 2026-10-07 it
+// could also move a conversation (the record changed accounts with its ids,
+// and the source's files went into the backup); the operator asked for that
+// path to go. Journal entries and lineage links of mode "move" written
+// before that still load (journal.ts, lineage.ts), and `restore` undoes such
+// an entry like any other, from its created, moved and backed-up lists.
+//
 // Why copies get new ids: the desktop app parks sessions by sessionId when
 // switching accounts, so one id living on two accounts could route a write to
-// the wrong directory. A moved record keeps its ids because after the move
-// only one account holds it.
+// the wrong directory.
 //
 // What a copy changes: in the transcript files the technical session id, and
 // at the end of the transcript a tombstone for every live Remote Control link
@@ -35,8 +41,8 @@
 // the same title, the same SSH host, the same archive state.
 //
 // Remote Control: a conversation followed or driven from claude.ai is linked
-// to a claude.ai session of the account it ran under. Copies and moves switch
-// that off, on the operator's request of 2026-09-28: the record says
+// to a claude.ai session of the account it ran under. Copies switch that
+// off, on the operator's request of 2026-09-28: the record says
 // "switched off by the person" (records.ts, withRemoteControlOff) and the
 // transcript gets bridge tombstones, so neither the app nor the CLI links the
 // conversation up with the old account's claude.ai session again. Switching
@@ -112,38 +118,52 @@ import {
 } from './transcripts.ts';
 
 /**
- * copy: the target gets a copy and the source stays as it is (an import
- * from "No account" is a copy of a transcript without a record). move: the
- * conversation ends up on the target account, and what the source held
- * goes into the backup.
+ * What to do with a conversation whose linked copy the target already holds
+ * (assessSync in inventory.ts found the pair). The command line gives one
+ * policy for the whole run (--on-conflict); the TUI asks about every such
+ * conversation (tui/transfer.ts, the pair question) and gives each its own.
+ *   sync                 the command line's default (--on-conflict skip): a
+ *                        copy that is behind is brought up to date, an
+ *                        identical one is repaired when it needs it (else
+ *                        "up to date"), a newer or diverged one is skipped;
+ *                        the TUI's "Keep" answer for an identical pair
+ *   overwrite-conflicts  as sync, and a newer or diverged copy is overwritten
+ *                        too (--on-conflict overwrite)
+ *   skip                 leave the copy as it is whatever its state, without
+ *                        looking at the SSH host; the result lists the
+ *                        conversation as skipped (a TUI answer)
+ *   overwrite            replace the copy with the source whatever its state,
+ *                        an identical one included: the transcript is written
+ *                        again and the record refreshed (title, archive
+ *                        state), the previous copy goes into backups (a TUI
+ *                        answer)
+ * A copy that holds another conversation ("unrelated") is never overwritten,
+ * and a conversation linked to several copies ("ambiguous") never touched.
  */
-export type TransferMode = 'copy' | 'move';
-/**
- * What to do when the linked copy on the target is newer than the source or
- * diverged from it: skip leaves it, overwrite replaces it with the source.
- * A copy that holds another conversation is never overwritten.
- */
-export type ConflictPolicy = 'skip' | 'overwrite';
+export type ExistingPolicy = 'sync' | 'overwrite-conflicts' | 'skip' | 'overwrite';
 
 /**
  * One conversation to transfer, as the CLI and the TUI hand it to
- * executeTransfer: the source, the target account, the mode, the
- * assessment of the source against the target and the conflict policy.
+ * executeTransfer: the source, the target account, the assessment of the
+ * source against the target and the policy for a copy the target already
+ * holds. An import from "No account" is a copy of a transcript without a
+ * record; the source is never touched.
  */
 export interface TransferItem {
   source: Conversation;
   target: AccountInfo;
-  mode: TransferMode;
   assessment: SyncAssessment;
-  /** What to do when the target copy is newer or diverged. */
-  onConflict: ConflictPolicy;
+  /** What to do when the target already holds a linked copy (see ExistingPolicy). */
+  onExisting: ExistingPolicy;
 }
 
 /**
  * refused: the guard said no (Claude running); nothing of this operation remains on disk.
  * repaired: an up-to-date copy got Remote Control off or its transcript on the SSH host.
+ * Journal entries written before 2026-10-07 may carry the action "moved"
+ * (journal.ts); no outcome produces it any more.
  */
-export type OutcomeAction = 'created' | 'updated' | 'moved' | 'repaired' | 'up-to-date' | 'skipped' | 'refused' | 'failed';
+export type OutcomeAction = 'created' | 'updated' | 'repaired' | 'up-to-date' | 'skipped' | 'refused' | 'failed';
 
 /**
  * What executeTransfer did with one item, or would do in a dry run: the
@@ -244,7 +264,7 @@ function synthesizedRecord(source: Conversation, sessionId: string, cliSessionId
   return record;
 }
 
-/** The stamp a record gets when this tool copies or moves it (see CcasStamp). */
+/** The stamp a record gets when this tool copies it (see CcasStamp). */
 function stampFor(source: Conversation, now: number): CcasStamp {
   return {
     copiedFrom: endpointOf(source),
@@ -280,20 +300,6 @@ async function scheduledTaskWarning(source: Conversation): Promise<string | null
     // No scheduled-tasks file: nothing to warn about.
   }
   return null;
-}
-
-/**
- * A move onto an existing copy takes the source record away. When that record
- * pointed at a CLI process on an SSH host, nothing is left to adopt or stop
- * the process (the app does both only through the record), so the person is
- * told where it runs.
- */
-function remoteProcessWarning(source: Conversation): string | null {
-  const record = source.record?.record;
-  const processId = record?.['sshRemoteProcessId'];
-  if (processId === undefined || processId === null) return null;
-  const host = record?.sshConfig?.sshHost ?? 'the SSH host';
-  return `the source record pointed at process ${String(processId)} on ${host}; with the record gone nothing adopts or stops that process, so stop it there if it still runs`;
 }
 
 function outcomeOf(
@@ -367,37 +373,10 @@ async function copySessionKeyedDirs(context: OperationContext, log: OperationLog
   }
 }
 
-/** Moves the per-session directories of a CLI session id into the backup mirror: an update replaces them, a move takes them away with the transcript. */
+/** Moves the per-session directories of the target copy's CLI session id into the backup mirror: an update replaces them with the source's. */
 async function moveAwaySessionKeyedDirs(context: OperationContext, log: OperationLog, cli: string | null): Promise<void> {
   if (!cli || !isUuid(cli)) return;
   for (const dir of await sessionKeyedDirs(context.paths.claudeDir, cli)) await log.moveAway(dir.path);
-}
-
-/**
- * Moves the source record and its transcript files into the backup mirror
- * (the "remove" half of a move), the per-session directories of its CLI
- * session included. For an SSH session the whole mirror goes, but only a
- * directory that really is this session's mirror (ssh-<its id>). The
- * transcript on the SSH host stays: the host is not this tool's to clean
- * up, and a transcript no record points at does no harm there.
- */
-async function removeSourceFiles(context: OperationContext, log: OperationLog, source: Conversation, target: Conversation | null): Promise<void> {
-  if (source.record) await log.moveAway(source.record.path);
-  const transcript = source.transcript;
-  if (!transcript) return;
-  // Found while adding SSH mirrors: a record copied by hand to a second account
-  // keeps its record id and CLI session id, so both accounts point at one
-  // transcript and pairing matches the two by record id. Moving "the source
-  // transcript" away then took the target's transcript with it. A transcript
-  // the target uses as well stays where it is.
-  if (target?.transcript?.path === transcript.path) return;
-  if (isSshMirror(transcript)) {
-    await log.moveAway(transcript.projectDir);
-    return;
-  }
-  await log.moveAway(transcript.path);
-  if (transcript.sidecarDir) await log.moveAway(transcript.sidecarDir);
-  await moveAwaySessionKeyedDirs(context, log, transcript.cliSessionId);
 }
 
 /** The CLI session id of a conversation's transcript (the record's, else the transcript's own). */
@@ -622,14 +601,16 @@ async function createCopy(context: OperationContext, item: TransferItem, warning
 }
 
 /**
- * Brings the linked copy on the target up to date with the source (and, for a
- * move, then removes the source). The copy keeps its ids. Its old transcript
- * files go into the backup mirror as a whole and fresh ones are written, so a
- * restore puts back exactly what was there; on an SSH host the old copy is
- * kept aside under the journal id the same way.
+ * Brings the linked copy on the target up to date with the source, or
+ * replaces it with the source when the policy says overwrite (a newer,
+ * diverged or identical copy; for an identical one the transcript is the
+ * same afterwards and the record is refreshed). The copy keeps its ids. Its
+ * old transcript files go into the backup mirror as a whole and fresh ones
+ * are written, so a restore puts back exactly what was there; on an SSH host
+ * the old copy is kept aside under the journal id the same way.
  */
 async function updateExisting(context: OperationContext, item: TransferItem, warnings: string[]): Promise<TransferOutcome> {
-  const { source, mode, assessment } = item;
+  const { source, assessment } = item;
   const existing = assessment.existing;
   const transcript = source.transcript;
   if (!existing?.record) return outcomeOf(item, 'failed', 'target copy has no record to update', warnings, context.dryRun);
@@ -639,11 +620,6 @@ async function updateExisting(context: OperationContext, item: TransferItem, war
   // (see lastLinkedCliSessionId), else a fresh one.
   const targetCli = existing.cliSessionId ?? lastLinkedCliSessionId(context, existing) ?? randomUUID();
   const record = recordForCopy(source, existing.record.record.sessionId, targetCli, now);
-  const finalAction: OutcomeAction = mode === 'move' ? 'moved' : 'updated';
-  if (mode === 'move') {
-    const remote = remoteProcessWarning(source);
-    if (remote) warnings.push(remote);
-  }
   const sshTarget = sshHostOf(source);
   let hostPlan: HostCopyPlan | null = null;
   if (isSshMirror(transcript)) {
@@ -659,13 +635,13 @@ async function updateExisting(context: OperationContext, item: TransferItem, war
     }
   }
   const host = hostPlan ? `transcript also on ${describeHost(hostPlan.target)}` : null;
-  if (context.dryRun) return outcomeOf(item, finalAction, null, warnings, true, { host });
+  if (context.dryRun) return outcomeOf(item, 'updated', null, warnings, true, { host });
   const gate = await openGate(context, item, warnings);
   if (isOutcome(gate)) return gate;
 
   const targetEndpoint = { ...endpointOf(existing), cliSessionId: targetCli };
   const log = openLog(context, now, {
-    mode,
+    mode: source.account ? 'copy' : 'import',
     action: 'updated',
     title: source.title,
     rootUuid: source.summary?.rootUuid ?? null,
@@ -709,121 +685,15 @@ async function updateExisting(context: OperationContext, item: TransferItem, war
       rootUuid: source.summary?.rootUuid ?? source.key,
       at: now,
       journalId: log.entry.id,
-      mode: source.account ? mode : 'import',
+      mode: source.account ? 'copy' : 'import',
       action: 'updated',
       sourceLineCount: source.summary?.lineCount ?? 0,
       source: endpointOf(source),
       target: targetEndpoint,
     });
     await writeRecord(existing.record.path, record);
-    if (mode === 'move') await removeSourceFiles(context, log, source, existing);
-    await log.finish(finalAction);
-    return outcomeOf(item, finalAction, null, log.entry.warnings, false, { host, journalId: log.entry.id });
-  } catch (error) {
-    return failed(log, item, error);
-  }
-}
-
-/**
- * Where a moved conversation's transcript on its SSH host still links up
- * with a claude.ai session, found before the move (read only). An unreachable
- * host only costs a warning: the moved record has Remote Control off either
- * way, and the transcript lines matter only once it is switched on again.
- */
-async function planMovedHostTombstones(context: OperationContext, source: Conversation, warnings: string[]): Promise<{ target: HostTarget; path: string } | null> {
-  const target = sshHostOf(source);
-  const cli = cliSessionIdOf(source);
-  if (!target || !cli || !isUuid(cli) || (source.transcript !== null && !isSshMirror(source.transcript))) return null;
-  try {
-    const probe = await probeHost(hostRunnerOf(context), target, {
-      sourceCliSessionId: cli,
-      targetCliSessionId: cli,
-      hint: source.record?.record.sshRemoteTranscriptPath as string | undefined,
-    });
-    return probe.target !== null && probe.targetLive.length > 0 ? { target, path: probe.target } : null;
-  } catch (error) {
-    if (!(error instanceof HostStepError)) throw error;
-    warnings.push(`Remote Control could not be switched off in the transcript on ${describeHost(target)} (${error.message}); the moved record has it off`);
-    return null;
-  }
-}
-
-/**
- * A move whose target has no copy yet: the record file changes directory, ids
- * and transcript stay. Remote Control is switched off on the way: in the
- * record, and in the transcript (in place, after a backup, or on the SSH host).
- */
-async function moveRecord(context: OperationContext, item: TransferItem, warnings: string[]): Promise<TransferOutcome> {
-  const { source, target } = item;
-  if (!source.record) return outcomeOf(item, 'failed', 'nothing to move: the source has no record', warnings, context.dryRun);
-  const destination = path.join(target.dir, source.record.fileName);
-  if (await pathExists(destination)) {
-    return outcomeOf(item, 'failed', `a record named ${source.record.fileName} already exists on the target account`, warnings, context.dryRun);
-  }
-  const transcript = source.transcript;
-  const localTombstones = transcript !== null && !isSshMirror(transcript) && (await liveBridges(transcript.path)).length > 0;
-  const hostTombstones = await planMovedHostTombstones(context, source, warnings);
-  const host = hostTombstones ? `Remote Control off on ${describeHost(hostTombstones.target)}` : null;
-  if (context.dryRun) return outcomeOf(item, 'moved', null, warnings, true, { host });
-  const gate = await openGate(context, item, warnings);
-  if (isOutcome(gate)) return gate;
-
-  const now = nowOf(context);
-  const log = openLog(context, now, {
-    mode: 'move',
-    action: 'moved',
-    title: source.title,
-    rootUuid: source.summary?.rootUuid ?? null,
-    source: endpointOf(source),
-    target: { accountId: target.accountId, orgId: target.orgId, sessionId: source.record.record.sessionId, cliSessionId: source.cliSessionId ?? undefined },
-    relation: item.assessment.state,
-  });
-  for (const warning of warnings) log.warn(warning);
-  await log.start();
-  try {
-    // The record keeps its ids, but it is rewritten with the copy-point stamp so
-    // the e-mails its transcript carries from the source account do not count
-    // for the target, and with Remote Control off. The original content is
-    // backed up for restore, and so is the transcript before its tombstones.
-    await log.backup(source.record.path);
-    if (localTombstones && transcript) {
-      await log.backup(transcript.path);
-      await appendBridgeTombstones(transcript.path);
-    }
-    if (hostTombstones) {
-      try {
-        await log.remoteTombstoned(hostTombstones.target, hostTombstones.path);
-        await tombstoneOnHost(hostRunnerOf(context), hostTombstones.target, hostTombstones.path);
-      } catch (error) {
-        if (!(error instanceof HostStepError)) throw error;
-        log.warn(`Remote Control could not be switched off in the transcript on ${describeHost(hostTombstones.target)} (${error.message}); the moved record has it off`);
-      }
-    }
-    await log.move(source.record.path, destination);
-    await assertStillAllowed(context);
-    // Found by the review of 2026-10-05: a move kept the record's ids and so
-    // wrote no lineage link, leaving the stamp below as the only copy point,
-    // and the app drops the stamp the first time it saves the record. From
-    // then on the cutoff in voteEmail (inventory.ts) was zero and the source
-    // account's session_context lines voted for the target account, which
-    // could relabel the target account with the source's e-mail in this
-    // tool's own lists (reproduced on fixtures before the fix). The link is
-    // the lasting copy point, as for copies; pairing never needs it, since
-    // the record id already pairs a moved record, and the source side of the
-    // link names a record that no longer exists.
-    await context.lineage.add({
-      rootUuid: source.summary?.rootUuid ?? source.key,
-      at: now,
-      journalId: log.entry.id,
-      mode: 'move',
-      action: 'moved',
-      sourceLineCount: source.summary?.lineCount ?? 0,
-      source: endpointOf(source),
-      target: { accountId: target.accountId, orgId: target.orgId, sessionId: source.record.record.sessionId, cliSessionId: endpointOf(source).cliSessionId },
-    });
-    await writeRecord(destination, { ...withRemoteControlOff(source.record.record), ccas: stampFor(source, now) });
-    await log.finish('moved');
-    return outcomeOf(item, 'moved', null, log.entry.warnings, false, { host, journalId: log.entry.id });
+    await log.finish('updated');
+    return outcomeOf(item, 'updated', null, log.entry.warnings, false, { host, journalId: log.entry.id });
   } catch (error) {
     return failed(log, item, error);
   }
@@ -935,9 +805,11 @@ async function applyRepair(context: OperationContext, log: OperationLog, plan: R
 }
 
 /**
- * Copy mode for a pair that is already in sync: nothing to copy, but a copy
- * made before 2026-09-28 is repaired (RepairPlan). Without anything to repair
- * this is the old "up to date".
+ * A pair that is already in sync under the sync policies: nothing to copy,
+ * but a copy made before 2026-09-28 is repaired (RepairPlan). Without
+ * anything to repair this is the old "up to date". Planning the repair looks
+ * at the SSH host of an SSH conversation, which is why the TUI's "Skip"
+ * answer for an identical pair never reaches this function.
  */
 async function repairCopy(context: OperationContext, item: TransferItem, warnings: string[], upToDate: string): Promise<TransferOutcome> {
   let plan: RepairPlan | null;
@@ -953,7 +825,7 @@ async function repairCopy(context: OperationContext, item: TransferItem, warning
   const gate = await openGate(context, item, warnings);
   if (isOutcome(gate)) return gate;
   const log = openLog(context, nowOf(context), {
-    mode: item.mode,
+    mode: item.source.account ? 'copy' : 'import',
     action: 'repaired',
     title: item.source.title,
     rootUuid: item.source.summary?.rootUuid ?? null,
@@ -973,107 +845,51 @@ async function repairCopy(context: OperationContext, item: TransferItem, warning
 }
 
 /**
- * A move whose target already holds an identical copy: only the source side
- * disappears, after the copy got what copies made before 2026-09-28 lack
- * (see RepairPlan), so the conversation that stays is one the app can resume.
+ * Performs one transfer decision end to end. Never throws for a predictable
+ * refusal; those come back as outcomes. The policy for an existing copy
+ * (ExistingPolicy) decides the states where the target already holds the
+ * conversation: a "skip" answer returns before anything looks at the SSH
+ * host, which is what makes skipping hundreds of identical SSH pairs quick.
  */
-async function removeSource(context: OperationContext, item: TransferItem, warnings: string[], reason: string): Promise<TransferOutcome> {
-  const { source, target } = item;
-  const remote = remoteProcessWarning(source);
-  if (remote) warnings.push(remote);
-  let plan: RepairPlan | null;
-  try {
-    plan = await planRepair(context, item, warnings);
-  } catch (error) {
-    if (!(error instanceof HostStepError)) throw error;
-    return outcomeOf(item, 'failed', `${error.message}; the source stays where it is`, warnings, context.dryRun);
-  }
-  const repair = describeRepair(plan);
-  const fullReason = repair ? `${reason}; copy repaired: ${repair}` : reason;
-  if (context.dryRun) return outcomeOf(item, 'moved', fullReason, warnings, true);
-  const gate = await openGate(context, item, warnings);
-  if (isOutcome(gate)) return gate;
-  const now = nowOf(context);
-  const log = openLog(context, now, {
-    mode: 'move',
-    action: 'moved',
-    title: source.title,
-    rootUuid: source.summary?.rootUuid ?? null,
-    source: endpointOf(source),
-    target: item.assessment.existing ? endpointOf(item.assessment.existing) : { accountId: target.accountId, orgId: target.orgId },
-    relation: item.assessment.state,
-  });
-  for (const warning of warnings) log.warn(warning);
-  await log.start();
-  try {
-    if (plan && repair) await applyRepair(context, log, plan);
-    // Every move leaves a link (see moveRecord); here the copy that stays
-    // already has one from when it was made, and this one records that the
-    // source side went away in a move, with the copy point of that moment.
-    if (item.assessment.existing) {
-      await context.lineage.add({
-        rootUuid: source.summary?.rootUuid ?? source.key,
-        at: now,
-        journalId: log.entry.id,
-        mode: 'move',
-        action: 'moved',
-        sourceLineCount: source.summary?.lineCount ?? 0,
-        source: endpointOf(source),
-        target: endpointOf(item.assessment.existing),
-      });
-    }
-    await removeSourceFiles(context, log, source, item.assessment.existing);
-    await log.finish('moved');
-    return outcomeOf(item, 'moved', fullReason, log.entry.warnings, false, { journalId: log.entry.id });
-  } catch (error) {
-    return failed(log, item, error);
-  }
-}
-
-/** Performs one transfer decision end to end. Never throws for a predictable refusal; those come back as outcomes. */
 export async function executeTransfer(context: OperationContext, item: TransferItem): Promise<TransferOutcome> {
-  const { source, target, mode, assessment } = item;
+  const { source, target, assessment, onExisting } = item;
   const warnings = [...assessment.warnings];
   const dryRun = context.dryRun;
 
   if (source.account && accountKey(source.account.accountId, source.account.orgId) === accountKey(target.accountId, target.orgId)) {
     return outcomeOf(item, 'failed', 'source and target are the same account', warnings, dryRun);
   }
-  if (mode === 'move' && !source.account) {
-    return outcomeOf(item, 'failed', 'unlisted transcripts can only be copied; the original stays where the CLI put it', warnings, dryRun);
-  }
   const scheduled = await scheduledTaskWarning(source);
   if (scheduled) warnings.push(scheduled);
 
   switch (assessment.state) {
     case 'no-transcript':
-      if (mode === 'copy') {
-        // A record without a transcript is still an entry in the side panel, so
-        // Copy makes a copy of the record alone. Once the target has one there is
-        // nothing to compare, so it counts as up to date (after a repair).
-        if (assessment.existing) {
-          return repairCopy(context, item, warnings, 'target already holds a copy of this record; the source has no transcript to compare');
-        }
-        return createCopy(context, item, warnings);
-      }
+      // A record without a transcript is still an entry in the side panel, so
+      // a copy of the record alone is made. Once the target has one there is
+      // nothing to compare, so it counts as up to date (after a repair); the
+      // TUI does not ask about such a pair, so no policy reaches here but sync.
       if (assessment.existing) {
-        return outcomeOf(item, 'skipped', 'target already has this conversation and the source has no transcript to update it with', warnings, dryRun);
+        return repairCopy(context, item, warnings, 'target already holds a copy of this record; the source has no transcript to compare');
       }
-      return moveRecord(context, item, warnings);
+      return createCopy(context, item, warnings);
     case 'new':
-      return mode === 'copy' ? createCopy(context, item, warnings) : moveRecord(context, item, warnings);
+      return createCopy(context, item, warnings);
     case 'up-to-date':
-      if (mode === 'copy') return repairCopy(context, item, warnings, 'target already holds an identical copy');
-      return removeSource(context, item, warnings, 'target already held an identical copy; source removed');
+      if (onExisting === 'skip') return outcomeOf(item, 'skipped', 'the target copy is identical; left as answered', warnings, dryRun);
+      if (onExisting === 'overwrite') return updateExisting(context, item, warnings);
+      return repairCopy(context, item, warnings, 'target already holds an identical copy');
     case 'update-available':
+      if (onExisting === 'skip') return outcomeOf(item, 'skipped', 'the target copy is behind the source; left as answered', warnings, dryRun);
       return updateExisting(context, item, warnings);
     case 'target-ahead':
     case 'diverged':
-      if (item.onConflict !== 'overwrite') {
+      if (onExisting === 'skip' || onExisting === 'sync') {
         const why =
-          assessment.state === 'target-ahead'
-            ? 'target copy is newer than the source (choose overwrite to replace it)'
-            : 'both copies changed since they diverged (choose overwrite to replace the target)';
+          onExisting === 'skip'
+            ? `the target copy is ${assessment.state === 'target-ahead' ? 'newer than the source' : 'diverged from the source'}; left as answered`
+            : assessment.state === 'target-ahead'
+              ? 'target copy is newer than the source (choose overwrite to replace it)'
+              : 'both copies changed since they diverged (choose overwrite to replace the target)';
         return outcomeOf(item, 'skipped', why, warnings, dryRun);
       }
       return updateExisting(context, item, warnings);

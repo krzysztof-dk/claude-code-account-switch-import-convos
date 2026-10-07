@@ -42,6 +42,14 @@ describe('displayStatus', () => {
     assert.equal(displayStatus(entry('a', 'running')), 'interrupted');
   });
 
+  it('still takes an entry of mode move, as versions before 2026-10-07 wrote them', () => {
+    // The move path is gone; journals written before keep such entries and
+    // they must still list (and restore, see operations.test.ts).
+    const old = entry('old', 'done', { mode: 'move', action: 'moved', moved: [{ from: '/a/local_x.json', to: '/b/local_x.json' }] });
+    assert.equal(displayStatus(old), 'done');
+    assert.equal(old.mode, 'move');
+  });
+
   it('shows every other status as it is', () => {
     for (const status of ['done', 'failed', 'restored', 'resolved'] as const) assert.equal(displayStatus(entry('a', status)), status);
   });

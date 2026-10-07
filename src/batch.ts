@@ -8,8 +8,10 @@
 // the operations done so far in that run are undone here, newest first, each
 // through restoreEntry, so every undo is a journal entry of its own and the
 // journal reads exactly as if the person had restored them by hand in that
-// order. Newest first because a later operation may build on an earlier one
-// (a move onto a copy the same run made).
+// order. Newest first because that is the order a person undoing by hand
+// would take, and the only one safe should a later operation ever build on
+// an earlier one (within one run no two operations touch the same
+// conversation, since every conversation is transferred once).
 //
 // What counts as the run: the outcomes executeTransfer returned so far. The
 // ones with a journal id opened an entry; an entry whose operation was rolled

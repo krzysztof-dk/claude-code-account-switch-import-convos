@@ -52,8 +52,9 @@ export interface RemoteSteps {
   moved: { from: string; to: string }[];
   /**
    * Transcripts on the host that got Remote Control tombstones appended in
-   * place (a moved conversation, or a copy the host already had). Restore
-   * leaves those lines: they only keep Remote Control off.
+   * place (the repair of a copy the host already had; before 2026-10-07
+   * also a moved conversation). Restore leaves those lines: they only keep
+   * Remote Control off.
    */
   tombstoned: string[];
 }
@@ -68,11 +69,20 @@ export interface JournalEntry {
   id: string;
   /** ISO time the operation started. */
   at: string;
+  /**
+   * copy, import (a copy of a transcript without a record) or restore. move
+   * was written by versions before 2026-10-07, which could move a
+   * conversation between accounts (the record changed directory with its
+   * ids, the source's files went into the backup); the tool copies only
+   * now, but such entries still load, list and restore like any other, from
+   * their created, moved and backed-up lists.
+   */
   mode: 'copy' | 'move' | 'import' | 'restore';
   /**
-   * What the operation did to the target: created, updated, moved, repaired
-   * (an up-to-date copy got what copies made before 2026-09-28 lack: Remote
-   * Control off, its transcript on the SSH host), or nothing.
+   * What the operation did to the target: created, updated, repaired (an
+   * up-to-date copy got what copies made before 2026-09-28 lack: Remote
+   * Control off, its transcript on the SSH host), or nothing; moved only in
+   * entries from before 2026-10-07 (see `mode`).
    */
   action: 'created' | 'updated' | 'moved' | 'repaired' | 'none';
   status: JournalStatus;
