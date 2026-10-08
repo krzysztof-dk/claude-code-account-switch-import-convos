@@ -21,7 +21,7 @@ import {
   type World,
 } from '../test/fixtures.ts';
 import { AccountStore, type AccountInfo } from './accounts.ts';
-import { describeOutcome, findConversation, planTransfers, summaryLine } from './cli.ts';
+import { describeOutcome, findConversation, planTransfers, policyOf, positionPrefix, summaryLine } from './cli.ts';
 import { pathExists } from './fsx.ts';
 import { assessSync, buildInventory, conversationsOf, type Conversation, type Inventory } from './inventory.ts';
 import { LOCK_FILE_NAME } from './lock.ts';
@@ -103,18 +103,19 @@ describe('cli (end to end)', () => {
   });
 
   it('transfers with a dry run first, then for real, and restores from the journal', async () => {
-    const dry = await run('transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--mode', 'copy', '--session', cliId.slice(0, 8), '--dry-run');
+    const dry = await run('transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--session', cliId.slice(0, 8), '--dry-run');
     assert.equal(dry.code, 0);
-    assert.match(dry.stdout, /\[dry-run\] created "E2E record"/);
+    // Every result line says where the conversation stands in the run.
+    assert.match(dry.stdout, /^\[1\/1\] \[dry-run\] created "E2E record"/m);
     assert.deepEqual((await readdir(world.b.dir)).filter((name) => name.startsWith('local_')), []);
 
-    const real = await run('transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--mode', 'copy', '--session', cliId);
+    const real = await run('transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--session', cliId);
     assert.equal(real.code, 0, real.stderr);
-    assert.match(real.stdout, /created "E2E record" on bbbbbbbb\.\.\. as local_/);
+    assert.match(real.stdout, /^\[1\/1\] created "E2E record" on bbbbbbbb\.\.\. as local_/m);
     assert.match(real.stdout, /Start the Claude app/);
     assert.equal((await readdir(world.b.dir)).filter((name) => name.startsWith('local_')).length, 1);
 
-    const again = await run('transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--mode', 'copy', '--session', cliId);
+    const again = await run('transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--session', cliId);
     assert.equal(again.code, 0, again.stderr);
     assert.match(again.stdout, /up to date/);
 
@@ -137,7 +138,7 @@ describe('cli: --all, --exclude and interrupted operations', () => {
   /** Record ids of the three conversations on account A; the first is the one left out. */
   let ids: string[];
   const run = runnerFor(() => world);
-  const transferAll = (...extra: string[]): Promise<Run> => run('transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--mode', 'copy', '--all', ...extra);
+  const transferAll = (...extra: string[]): Promise<Run> => run('transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--all', ...extra);
 
   before(async () => {
     world = await makeWorld();
@@ -155,11 +156,17 @@ describe('cli: --all, --exclude and interrupted operations', () => {
   });
 
   it('refuses flag combinations that do not make sense, with exit code 1', async () => {
-    const base = ['transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--mode', 'copy'];
+    const base = ['transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb'];
     for (const extra of [[], ['--all', '--session', ids[1]!], ['--exclude', ids[0]!]]) {
       const result = await run(...base, ...extra);
       assert.equal(result.code, 1, extra.join(' '));
     }
+    // --mode went with the move path (2026-10-07): an old command line is a usage error, not a silent copy.
+    const stale = await run(...base, '--mode', 'copy', '--all');
+    assert.equal(stale.code, 1);
+    assert.match(stale.stderr, /Unknown option '--mode'/);
+    assert.match(stale.stderr, /Usage:/);
+    assert.deepEqual(await localRecords(world.b.dir), []);
   });
 
   it('stops on a mistyped --exclude before writing anything', async () => {
@@ -179,6 +186,11 @@ describe('cli: --all, --exclude and interrupted operations', () => {
     const lines = result.stdout.trim().split('\n');
     assert.match(lines[0] ?? '', /^\[dry-run\] excluded "kept apart" \(local_/);
     assert.equal(lines.filter((line) => line.includes('excluded "')).length, 1);
+    // Excluded conversations are not processed, so only the two created ones are counted, 1 and 2 of 2.
+    assert.deepEqual(
+      lines.filter((line) => line.includes('] created "')).map((line) => line.slice(0, line.indexOf(' [dry-run]'))),
+      ['[1/2]', '[2/2]'],
+    );
     assert.equal(lines.at(-1), '[dry-run] summary: 2 created, 0 updated, 0 up to date, 0 skipped, 1 excluded, 0 failed');
     assert.deepEqual(await localRecords(world.b.dir), []);
   });
@@ -188,7 +200,7 @@ describe('cli: --all, --exclude and interrupted operations', () => {
     const real = await transferAll('--exclude', ids[0]!);
     assert.equal(real.code, 0, real.stderr);
     assert.equal(real.stdout.trim().split('\n').at(-1), 'summary: 2 created, 0 updated, 0 up to date, 0 skipped, 1 excluded, 0 failed');
-    assert.match(real.stdout, /created "over ssh" on bbbbbbbb\.\.\. as local_\S+, transcript also on build@mini\.local/);
+    assert.match(real.stdout, /^\[[12]\/2\] created "over ssh" on bbbbbbbb\.\.\. as local_\S+, transcript also on build@mini\.local/m);
     assert.equal((await localRecords(world.b.dir)).length, 2);
     // The SSH copy got its transcript and side folder on the (fake) host, next to the original.
     assert.equal((await readdir(hostProjectDir(world))).length, hostBefore + 2);
@@ -318,9 +330,8 @@ describe('cli: the pieces the commands and the TUI share', () => {
     item: {
       source: conversation(twinOne),
       target: accountB,
-      mode: 'copy',
       assessment: { state: 'new', existing: null, comparison: null, warnings: [] },
-      onConflict: 'skip',
+      onExisting: 'sync',
     },
     action,
     reason: null,
@@ -345,7 +356,6 @@ describe('cli: the pieces the commands and the TUI share', () => {
       describeOutcome(outcome('repaired', { ...journal, reason: 'Remote Control switched off' })),
       'repaired "twin one" on bbbbbbbb...: Remote Control switched off [journal 20261006T100000Z-abcdef]',
     );
-    assert.equal(describeOutcome(outcome('moved', { ...journal, host: 'transcript stays on build@mini.local' })), 'moved "twin one" to bbbbbbbb..., transcript stays on build@mini.local [journal 20261006T100000Z-abcdef]');
     // An up-to-date copy wrote nothing, so a journal id would mislead and is left out.
     assert.equal(describeOutcome(outcome('up-to-date', journal)), 'up to date "twin one" on bbbbbbbb...');
     assert.equal(describeOutcome(outcome('skipped', { reason: 'the target copy is newer' })), 'skipped "twin one": the target copy is newer');
@@ -360,7 +370,14 @@ describe('cli: the pieces the commands and the TUI share', () => {
     assert.equal(describeOutcome(long), `[dry-run] skipped "${'x'.repeat(57)}..."`);
   });
 
-  it('sums up a transfer: six counts always, in order, the rare three only when there are any', () => {
+  it('puts the position in the run first, before the dry-run mark', () => {
+    assert.equal(positionPrefix(undefined), '');
+    assert.equal(positionPrefix({ index: 3, total: 31 }), '[3/31] ');
+    assert.equal(describeOutcome(outcome('up-to-date'), { index: 3, total: 31 }), '[3/31] up to date "twin one" on bbbbbbbb...');
+    assert.equal(describeOutcome(outcome('created', { dryRun: true }), { index: 31, total: 31 }), '[31/31] [dry-run] created "twin one" on bbbbbbbb...');
+  });
+
+  it('sums up a transfer: six counts always, in order, the rare two only when there are any', () => {
     assert.equal(summaryLine(new Map(), 0), 'summary: 0 created, 0 updated, 0 up to date, 0 skipped, 0 excluded, 0 failed');
     const tally = new Map<OutcomeAction, number>([
       ['failed', 1],
@@ -371,25 +388,29 @@ describe('cli: the pieces the commands and the TUI share', () => {
       ['repaired', 0],
     ]);
     assert.equal(summaryLine(tally, 6), 'summary: 2 created, 5 updated, 4 up to date, 3 skipped, 6 excluded, 1 failed');
-    // Added in a fixed order (repaired, moved, refused), whatever order the tally has.
-    tally.set('refused', 1).set('moved', 2).set('repaired', 3);
-    assert.equal(summaryLine(tally, 0), 'summary: 2 created, 5 updated, 4 up to date, 3 skipped, 0 excluded, 1 failed, 3 repaired, 2 moved, 1 refused');
+    // Added in a fixed order (repaired, refused), whatever order the tally has.
+    tally.set('refused', 1).set('repaired', 3);
+    assert.equal(summaryLine(tally, 0), 'summary: 2 created, 5 updated, 4 up to date, 3 skipped, 0 excluded, 1 failed, 3 repaired, 1 refused');
+  });
+
+  it('maps --on-conflict to the two command-line policies, which never skip an identical or a behind copy', () => {
+    assert.equal(policyOf('skip'), 'sync');
+    assert.equal(policyOf('overwrite'), 'overwrite-conflicts');
   });
 
   it('plans one item per conversation, with its assessment against the target and the policy given', () => {
     const chosen = [conversation(twinTwo), conversation(loner)];
-    const items = planTransfers(inventory, accountB, chosen, 'move', 'overwrite');
+    const items = planTransfers(inventory, accountB, chosen, 'overwrite-conflicts');
     assert.equal(items.length, 2);
     const targetConversations = conversationsOf(inventory, accountB);
     for (const [index, item] of items.entries()) {
       assert.equal(item.source, chosen[index]);
       assert.equal(item.target, accountB);
-      assert.equal(item.mode, 'move');
-      assert.equal(item.onConflict, 'overwrite');
+      assert.equal(item.onExisting, 'overwrite-conflicts');
       assert.deepEqual(item.assessment, assessSync(chosen[index]!, targetConversations));
       assert.equal(item.assessment.state, 'new');
     }
-    assert.deepEqual(planTransfers(inventory, accountB, [], 'copy', 'skip'), []);
+    assert.deepEqual(planTransfers(inventory, accountB, [], 'sync'), []);
   });
 });
 
@@ -398,7 +419,7 @@ describe('cli: help, version and the data directory lock', () => {
   let cliId: string;
   const run = runnerFor(() => world);
   const lockFile = (): string => path.join(world.paths.dataDir, LOCK_FILE_NAME);
-  const transfer = (...extra: string[]): Promise<Run> => run('transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--mode', 'copy', '--session', cliId, ...extra);
+  const transfer = (...extra: string[]): Promise<Run> => run('transfer', '--from', EMAIL_A, '--to', 'bbbbbbbb', '--session', cliId, ...extra);
 
   before(async () => {
     world = await makeWorld();
@@ -413,7 +434,8 @@ describe('cli: help, version and the data directory lock', () => {
   it('prints the usage on --help and the package version on --version, both with exit code 0', async () => {
     const help = await run('--help');
     assert.equal(help.code, 0);
-    assert.match(help.stdout, /^ccas - move or copy/);
+    assert.match(help.stdout, /^ccas - copy Claude Code Desktop conversations/);
+    assert.ok(!help.stdout.includes('--mode'), 'the move path is gone, and with it --mode');
     assert.match(help.stdout, /Usage:/);
     assert.match(help.stdout, /Exit codes:/);
     assert.equal(help.stderr, '');

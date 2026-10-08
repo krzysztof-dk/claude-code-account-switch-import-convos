@@ -74,7 +74,7 @@ describe('batch: undoing a run', () => {
   const copy = async (title: string, override: Partial<OperationContext> = {}): Promise<TransferOutcome> => {
     const source = onA(title);
     const target = account(ACCOUNT_B);
-    const outcome = await executeTransfer({ ...context, ...override }, { source, target, mode: 'copy', assessment: assessSync(source, conversationsOf(inventory, target)), onConflict: 'skip' });
+    const outcome = await executeTransfer({ ...context, ...override }, { source, target, assessment: assessSync(source, conversationsOf(inventory, target)), onExisting: 'sync' });
     await rebuild();
     return outcome;
   };

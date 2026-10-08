@@ -327,9 +327,9 @@ export const REMOTE_CONTROL_FIELDS = [
  * Control on by itself (it only does so for records that are auto-eligible or
  * asked for it, and never after the person toggled it), and the person can
  * still switch it on in the app, which links the conversation to a new
- * claude.ai session of the account it now belongs to. Copies and moves go
- * through this because the claude.ai session of the source belongs to the
- * source account. The transcript half of the switch is the bridge tombstone
+ * claude.ai session of the account it now belongs to. Copies go through
+ * this because the claude.ai session of the source belongs to the source
+ * account. The transcript half of the switch is the bridge tombstone
  * (transcripts.ts, appendBridgeTombstones).
  */
 export function withRemoteControlOff(record: SessionRecord): SessionRecord {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { appendFile, copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import {
@@ -35,7 +35,7 @@ import { pathExists } from './fsx.ts';
 import { assessSync, buildInventory, conversationsOf, type Conversation, type Inventory } from './inventory.ts';
 import { Journal, type JournalEntry } from './journal.ts';
 import { LineageStore } from './lineage.ts';
-import { executeTransfer, restoreEntry, type ConflictPolicy, type OperationContext, type TransferMode, type TransferOutcome } from './operations.ts';
+import { executeTransfer, restoreEntry, type ExistingPolicy, type OperationContext, type TransferOutcome } from './operations.ts';
 import { SOURCE_BOUND_FIELDS, type SessionRecord } from './records.ts';
 import { bridgeTombstone, isSshMirror, sshMirrorDir, summarizeTranscript } from './transcripts.ts';
 
@@ -58,16 +58,16 @@ function harness(options: { withLineage: boolean }) {
     assert.ok(found, `conversation "${title}" on ${which.accountId}`);
     return found;
   };
+  /** One transfer with the policy given for an existing copy ('sync' is what the command line does without --on-conflict). */
   const transfer = async (
     source: Conversation,
     target: AccountInfo,
-    mode: TransferMode,
-    onConflict: ConflictPolicy = 'skip',
+    onExisting: ExistingPolicy = 'sync',
     dryRun = false,
     context: OperationContext = state.context,
   ): Promise<TransferOutcome> => {
     const assessment = assessSync(source, conversationsOf(state.inventory, target));
-    const outcome = await executeTransfer({ ...context, dryRun }, { source, target, mode, assessment, onConflict });
+    const outcome = await executeTransfer({ ...context, dryRun }, { source, target, assessment, onExisting });
     if (!dryRun) await rebuild();
     return outcome;
   };
@@ -102,13 +102,13 @@ describe('operations', () => {
   });
 
   it('refuses a transfer onto the same account', async () => {
-    const outcome = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_A), 'copy');
+    const outcome = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_A));
     assert.equal(outcome.action, 'failed');
     assert.match(outcome.reason ?? '', /same account/);
   });
 
   it('dry run reports the plan and touches nothing', async () => {
-    const outcome = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'copy', 'skip', true);
+    const outcome = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'sync', true);
     assert.equal(outcome.action, 'created');
     assert.equal(outcome.dryRun, true);
     assert.ok(outcome.newSessionId?.startsWith('local_'));
@@ -118,7 +118,7 @@ describe('operations', () => {
 
   it('refuses to write when the guard says Claude is running', async () => {
     const closed = { ...state.context, guard: async () => ({ allowed: false, reason: 'Claude is running' }) };
-    const outcome = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'copy', 'skip', false, closed);
+    const outcome = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'sync', false, closed);
     assert.equal(outcome.action, 'refused');
     assert.match(outcome.reason ?? '', /running/);
     assert.deepEqual(await recordsIn(state.world.b.dir), []);
@@ -131,7 +131,7 @@ describe('operations', () => {
     let calls = 0;
     const flaky = { ...state.context, guard: async () => (++calls === 1 ? { allowed: true, reason: null } : { allowed: false, reason: 'Claude started' }) };
     const source = listed(ACCOUNT_A, 'R1');
-    const outcome = await transfer(source, account(ACCOUNT_B), 'copy', 'skip', false, flaky);
+    const outcome = await transfer(source, account(ACCOUNT_B), 'sync', false, flaky);
     assert.equal(outcome.action, 'refused');
     assert.match(outcome.reason ?? '', /rolled back/);
     assert.deepEqual(await recordsIn(state.world.b.dir), []);
@@ -148,7 +148,7 @@ describe('operations', () => {
 
   it('copy creates an independent copy with new ids and a journal trail', async () => {
     const source = listed(ACCOUNT_A, 'R1');
-    const outcome = await transfer(source, account(ACCOUNT_B), 'copy');
+    const outcome = await transfer(source, account(ACCOUNT_B));
     assert.equal(outcome.action, 'created');
     assert.ok(outcome.journalId);
     const names = await recordsIn(state.world.b.dir);
@@ -177,10 +177,48 @@ describe('operations', () => {
 
   it('copying again is a no-op while the copies are identical', async () => {
     // This suite builds its inventory without lineage.json: the record stamp alone links the pair.
-    const outcome = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'copy');
+    const outcome = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B));
     assert.equal(outcome.action, 'up-to-date');
     // Only the copy itself is journaled as done; the rolled-back attempt above stays as a failed entry.
     assert.equal((await state.context.journal.list()).filter((entry) => entry.status === 'done').length, 1);
+  });
+
+  it('an identical pair is skipped, kept or written again as the pair question answers (the TUI policies)', async () => {
+    // The TUI asks about every conversation the target already holds (asked
+    // for by the operator on 2026-10-07); its three answers for an identical
+    // pair are skip, keep (the sync policy) and overwrite. A pair of its own,
+    // so the R1 pair above keeps the shape the tests below expect.
+    const world = state.world;
+    const t = await writeTranscript(world, { prompts: 1, title: 'T-same' });
+    const { path: recordPath } = await writeRecord(world, world.a, { cliSessionId: t.cliId, title: 'R-same' });
+    await rebuild();
+    assert.equal((await transfer(listed(ACCOUNT_A, 'R-same'), account(ACCOUNT_B))).action, 'created');
+    // The source record is renamed in the app; the transcripts stay identical.
+    const saved = await readJson<SessionRecord>(recordPath);
+    await writeFile(recordPath, JSON.stringify({ ...saved, title: 'R-same renamed' }, null, 2));
+    await rebuild();
+    const source = listed(ACCOUNT_A, 'R-same renamed');
+    assert.equal(assessSync(source, conversationsOf(state.inventory, account(ACCOUNT_B))).state, 'up-to-date');
+    const journalBefore = (await state.context.journal.list()).length;
+
+    const skipped = await transfer(source, account(ACCOUNT_B), 'skip');
+    assert.equal(skipped.action, 'skipped');
+    assert.equal(skipped.reason, 'the target copy is identical; left as answered');
+    assert.equal(skipped.journalId, null);
+    assert.equal((await state.context.journal.list()).length, journalBefore, 'skipping writes nothing');
+    assert.equal(listed(ACCOUNT_B, 'R-same').title, 'R-same', 'the copy keeps its old title');
+
+    assert.equal((await transfer(source, account(ACCOUNT_B))).action, 'up-to-date', 'keep: as before');
+    assert.equal((await transfer(source, account(ACCOUNT_B), 'overwrite-conflicts')).action, 'up-to-date', 'the command line never rewrites an identical copy');
+
+    const overwritten = await transfer(source, account(ACCOUNT_B), 'overwrite');
+    assert.equal(overwritten.action, 'updated');
+    const copy = listed(ACCOUNT_B, 'R-same renamed');
+    assert.deepEqual(copy.summary?.uuidChain, source.summary?.uuidChain, 'the same transcript');
+    const entry = await state.context.journal.get(overwritten.journalId!);
+    assert.equal(entry?.mode, 'copy');
+    assert.deepEqual(entry?.backedUp, [copy.record!.path], 'the previous record went into the backup');
+    assert.ok(entry?.moved.some((move) => move.from === copy.transcript!.path), 'and so did the previous transcript');
   });
 
   it('copying after the source grew updates the target copy and keeps the old one in the backup', async () => {
@@ -189,7 +227,12 @@ describe('operations', () => {
     await appendRounds({ cliId: source.transcript.cliSessionId, path: source.transcript.path, projectDir: source.transcript.projectDir, sidecarDir: '', cwd: source.cwd ?? '', lines: [], uuids: [] }, 1);
     await rebuild();
     const before = listed(ACCOUNT_B, 'R1');
-    const outcome = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'copy');
+    // The TUI's "Skip" for a pair where the source is longer leaves the copy behind.
+    const left = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'skip');
+    assert.equal(left.action, 'skipped');
+    assert.equal(left.reason, 'the target copy is behind the source; left as answered');
+    assert.equal(listed(ACCOUNT_B, 'R1').summary?.uuidChain.length, before.summary?.uuidChain.length);
+    const outcome = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B));
     assert.equal(outcome.action, 'updated');
     const after = listed(ACCOUNT_B, 'R1');
     assert.equal(after.record?.record.sessionId, before.record?.record.sessionId);
@@ -217,10 +260,14 @@ describe('operations', () => {
     assert.ok(copy.transcript);
     await appendRounds({ cliId: copy.transcript.cliSessionId, path: copy.transcript.path, projectDir: '', sidecarDir: '', cwd: '', lines: [], uuids: [] }, 1, Date.UTC(2026, 8, 5));
     await rebuild();
-    const skipped = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'copy');
+    const skipped = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B));
     assert.equal(skipped.action, 'skipped');
     assert.match(skipped.reason ?? '', /newer/);
-    const overwritten = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'copy', 'overwrite');
+    // The TUI's "Skip" answer says so in its own words; both write nothing.
+    const answered = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'skip');
+    assert.equal(answered.action, 'skipped');
+    assert.equal(answered.reason, 'the target copy is newer than the source; left as answered');
+    const overwritten = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'overwrite-conflicts');
     assert.equal(overwritten.action, 'updated');
     assert.deepEqual(listed(ACCOUNT_B, 'R1').summary?.uuidChain, listed(ACCOUNT_A, 'R1').summary?.uuidChain);
   });
@@ -234,48 +281,70 @@ describe('operations', () => {
     await rebuild();
     const assessment = assessSync(listed(ACCOUNT_A, 'R1'), conversationsOf(state.inventory, account(ACCOUNT_B)));
     assert.equal(assessment.state, 'diverged');
-    assert.equal((await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'copy')).action, 'skipped');
-    assert.equal((await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'copy', 'overwrite')).action, 'updated');
+    assert.equal((await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B))).action, 'skipped');
+    const answered = await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'skip');
+    assert.equal(answered.reason, 'the target copy is diverged from the source; left as answered');
+    // The TUI's "Overwrite" and the command line's --on-conflict overwrite do the same here.
+    assert.equal((await transfer(listed(ACCOUNT_A, 'R1'), account(ACCOUNT_B), 'overwrite')).action, 'updated');
   });
 
-  it('move onto an account without a copy renames the record and keeps the transcript', async () => {
+  it('restores a journal entry of mode "move" written by a version from before 2026-10-07', async () => {
+    // The move path is gone, but journals written before keep such entries, and
+    // "Restore from journal" must still put a moved record back: a restore only
+    // walks the entry's created, moved and backed-up lists, whatever its mode.
     const world = state.world;
-    const t = await writeTranscript(world, { prompts: 1, title: 'T-move' });
-    const { path: recordPath } = await writeRecord(world, world.a, { cliSessionId: t.cliId, title: 'R-move' });
-    await writeFile(path.join(world.a.dir, 'scheduled-tasks.json'), JSON.stringify({ scheduledTasks: [{ sessionId: `local_${t.cliId}` }] }));
+    const t = await writeTranscript(world, { prompts: 1, title: 'T-old-move' });
+    const { path: recordPath } = await writeRecord(world, world.a, { cliSessionId: t.cliId, title: 'R-old-move' });
+    const destination = path.join(world.b.dir, path.basename(recordPath));
     await rebuild();
-    const outcome = await transfer(listed(ACCOUNT_A, 'R-move'), account(ACCOUNT_B), 'move');
-    assert.equal(outcome.action, 'moved');
-    assert.ok(outcome.warnings.some((warning) => warning.includes('scheduled-tasks.json')));
-    assert.equal(await pathExists(recordPath), false);
-    assert.ok(await pathExists(path.join(world.b.dir, path.basename(recordPath))));
-    assert.ok(await pathExists(t.path));
-    const moved = listed(ACCOUNT_B, 'R-move');
-    assert.equal(moved.cliSessionId, t.cliId);
+    const source = listed(ACCOUNT_A, 'R-old-move');
+    assert.ok(source.record && source.summary);
+    // What an old move left: the record renamed into the other account's
+    // directory, rewritten with the copy-point stamp (so the source account's
+    // e-mail in its transcript does not vote for the target account), and a
+    // finished entry listing exactly that rename.
+    await rename(recordPath, destination);
+    const stamp = {
+      copiedFrom: { accountId: ACCOUNT_A.accountId, orgId: ACCOUNT_A.orgId, sessionId: source.record.record.sessionId, cliSessionId: t.cliId },
+      rootUuid: source.summary.rootUuid,
+      sourceLineCount: source.summary.lineCount,
+      at: Date.UTC(2026, 9, 1, 10, 0, 0),
+    };
+    await writeFile(destination, JSON.stringify({ ...source.record.record, ccas: stamp }, null, 2));
+    const id = '20261001T100000Z-0ddm0v';
+    await state.context.journal.append({
+      id,
+      at: '2026-10-01T10:00:00.000Z',
+      mode: 'move',
+      action: 'moved',
+      status: 'done',
+      title: 'R-old-move',
+      rootUuid: null,
+      source: { accountId: ACCOUNT_A.accountId, orgId: ACCOUNT_A.orgId, sessionId: path.basename(recordPath, '.json'), cliSessionId: t.cliId },
+      target: { accountId: ACCOUNT_B.accountId, orgId: ACCOUNT_B.orgId, sessionId: path.basename(recordPath, '.json'), cliSessionId: t.cliId },
+      relation: 'new',
+      backupDir: null,
+      backedUp: [],
+      created: [],
+      moved: [{ from: recordPath, to: destination }],
+      warnings: [],
+    });
+    await rebuild();
+    assert.ok(listed(ACCOUNT_B, 'R-old-move'));
+    const restored = await restoreEntry(state.context, id);
+    assert.deepEqual(restored.steps, [`moved ${destination} back to ${recordPath}`]);
+    assert.ok(await pathExists(recordPath));
+    assert.equal(await pathExists(destination), false);
+    assert.equal((await state.context.journal.get(id))?.status, 'restored');
+    await rebuild();
+    assert.ok(listed(ACCOUNT_A, 'R-old-move'));
   });
 
-  it('move onto an account that has a copy updates it and removes the source into backups', async () => {
-    const source = listed(ACCOUNT_A, 'R1');
-    assert.ok(source.transcript && source.record);
-    const outcome = await transfer(source, account(ACCOUNT_B), 'move', 'overwrite');
-    assert.equal(outcome.action, 'moved');
-    assert.equal(await pathExists(source.record.path), false);
-    assert.equal(await pathExists(source.transcript.path), false);
-    assert.equal(await pathExists(source.transcript.sidecarDir!), false);
-    const entry = await state.context.journal.get(outcome.journalId!);
-    assert.ok(entry?.backupDir);
-    assert.ok(await pathExists(path.join(entry.backupDir, ...source.transcript.path.split(path.sep).filter(Boolean))));
-    assert.equal(state.inventory.byAccount.get(accountKey(ACCOUNT_A.accountId, ACCOUNT_A.orgId))?.some((conversation) => conversation.title === 'R1'), false);
-    assert.equal(listed(ACCOUNT_B, 'R1').summary?.uuidChain.length, source.summary?.uuidChain.length);
-  });
-
-  it('imports an unlisted transcript with a synthesized record and refuses to move it', async () => {
+  it('imports an unlisted transcript with a synthesized record', async () => {
     const world = state.world;
     const t = await writeTranscript(world, { prompts: 2, cwd: CWD_BETA, title: 'U-import', model: 'claude-sonnet-5', bridgeOwner: ACCOUNT_A });
     await rebuild();
-    const refused = await transfer(unlisted('U-import'), account(ACCOUNT_B), 'move');
-    assert.equal(refused.action, 'failed');
-    const outcome = await transfer(unlisted('U-import'), account(ACCOUNT_B), 'copy');
+    const outcome = await transfer(unlisted('U-import'), account(ACCOUNT_B));
     assert.equal(outcome.action, 'created');
     const record = await readJson<SessionRecord>(path.join(world.b.dir, `${outcome.newSessionId}.json`));
     assert.equal(record.cwd, CWD_BETA);
@@ -291,29 +360,26 @@ describe('operations', () => {
     const entry = await state.context.journal.get(outcome.journalId!);
     assert.equal(entry?.mode, 'import');
     // Importing the same transcript again finds the copy through its stamp and has nothing to add.
-    assert.equal((await transfer(unlisted('U-import'), account(ACCOUNT_B), 'copy')).action, 'up-to-date');
+    assert.equal((await transfer(unlisted('U-import'), account(ACCOUNT_B))).action, 'up-to-date');
   });
 
-  it('a record without a transcript is copied as a record alone, and moved as a file', async () => {
+  it('a record without a transcript is copied as a record alone', async () => {
     const world = state.world;
     await writeRecord(world, world.a, { cliSessionId: '77777777-7777-4777-8777-777777777777', title: 'R-orphan' });
-    await writeRecord(world, world.a, { cliSessionId: '66666666-6666-4666-8666-666666666666', title: 'R-orphan-2' });
     await rebuild();
-    const copied = await transfer(listed(ACCOUNT_A, 'R-orphan'), account(ACCOUNT_B), 'copy');
+    const copied = await transfer(listed(ACCOUNT_A, 'R-orphan'), account(ACCOUNT_B));
     assert.equal(copied.action, 'created');
     assert.notEqual(copied.newCliSessionId, '77777777-7777-4777-8777-777777777777');
-    assert.equal((await transfer(listed(ACCOUNT_A, 'R-orphan'), account(ACCOUNT_B), 'copy')).action, 'up-to-date');
-    assert.equal((await transfer(listed(ACCOUNT_A, 'R-orphan-2'), account(ACCOUNT_B), 'move')).action, 'moved');
-    assert.ok(listed(ACCOUNT_B, 'R-orphan-2'));
+    assert.equal((await transfer(listed(ACCOUNT_A, 'R-orphan'), account(ACCOUNT_B))).action, 'up-to-date');
   });
 
-  it('restore undoes a copy, an update and a move', async () => {
+  it('restore undoes a copy and an update', async () => {
     const world = state.world;
     const context = state.context;
     const t = await writeTranscript(world, { prompts: 1, title: 'T-restore' });
-    const { path: recordPath } = await writeRecord(world, world.a, { cliSessionId: t.cliId, title: 'R-restore' });
+    await writeRecord(world, world.a, { cliSessionId: t.cliId, title: 'R-restore' });
     await rebuild();
-    const created = await transfer(listed(ACCOUNT_A, 'R-restore'), account(ACCOUNT_B), 'copy');
+    const created = await transfer(listed(ACCOUNT_A, 'R-restore'), account(ACCOUNT_B));
     assert.equal(created.action, 'created');
     const createdRecord = path.join(world.b.dir, `${created.newSessionId}.json`);
     assert.ok(await pathExists(createdRecord));
@@ -342,7 +408,7 @@ describe('operations', () => {
     await assert.rejects(() => restoreEntry(context, 'nope'), /not found/);
     await rebuild();
 
-    const copied = await transfer(listed(ACCOUNT_A, 'R-restore'), account(ACCOUNT_B), 'copy');
+    const copied = await transfer(listed(ACCOUNT_A, 'R-restore'), account(ACCOUNT_B));
     assert.equal(copied.action, 'created');
     await appendRounds(t, 1, Date.UTC(2026, 8, 8));
     await rebuild();
@@ -352,7 +418,7 @@ describe('operations', () => {
     // The source gained a tool result, which the update carries into the copy's
     // sidecar; after the restore the copy's sidecar must be exactly as before.
     await writeFile(path.join(t.sidecarDir, 'tool-results', 'result2.txt'), 'added later\n');
-    const updated = await transfer(listed(ACCOUNT_A, 'R-restore'), account(ACCOUNT_B), 'copy');
+    const updated = await transfer(listed(ACCOUNT_A, 'R-restore'), account(ACCOUNT_B));
     assert.equal(updated.action, 'updated');
     assert.ok(await pathExists(path.join(copySidecar, 'tool-results', 'result2.txt')));
     const longChain = listed(ACCOUNT_B, 'R-restore').summary?.uuidChain.length ?? 0;
@@ -360,14 +426,7 @@ describe('operations', () => {
     await rebuild();
     assert.ok((listed(ACCOUNT_B, 'R-restore').summary?.uuidChain.length ?? 0) < longChain);
     assert.deepEqual(await readTree(copySidecar), sidecarBefore);
-
-    const moved = await transfer(listed(ACCOUNT_A, 'R-restore'), account(ACCOUNT_B), 'move', 'overwrite');
-    assert.equal(moved.action, 'moved');
-    assert.equal(await pathExists(recordPath), false);
-    await restoreEntry(context, moved.journalId!);
-    assert.ok(await pathExists(recordPath));
-    assert.ok(await pathExists(t.path));
-    assert.ok((await stat(t.path)).size > 0);
+    assert.ok((await stat(t.path)).size > 0, 'the source transcript is never touched');
   });
 
   it('copies switch Remote Control off in the record and end the link in the transcript', async () => {
@@ -377,7 +436,7 @@ describe('operations', () => {
     await writeRecord(world, world.a, { cliSessionId: t.cliId, title: 'R-rc', bridgeSessionIds: ['session_rc'], ...rc });
     await rebuild();
     const sourceBytes = await readFile(t.path);
-    const outcome = await transfer(listed(ACCOUNT_A, 'R-rc'), account(ACCOUNT_B), 'copy');
+    const outcome = await transfer(listed(ACCOUNT_A, 'R-rc'), account(ACCOUNT_B));
     assert.equal(outcome.action, 'created');
     const newCli = outcome.newCliSessionId!;
     const record = await readJson<SessionRecord>(path.join(world.b.dir, `${outcome.newSessionId}.json`));
@@ -397,35 +456,18 @@ describe('operations', () => {
     await writeFile(copy.record!.path, JSON.stringify({ ...saved, ...rc }, null, 2));
     await writeFile(copyPath, replaceInBytes(sourceBytes, t.cliId, newCli));
     await rebuild();
-    const repaired = await transfer(listed(ACCOUNT_A, 'R-rc'), account(ACCOUNT_B), 'copy');
+    const repaired = await transfer(listed(ACCOUNT_A, 'R-rc'), account(ACCOUNT_B));
     assert.equal(repaired.action, 'repaired');
     assert.equal(repaired.reason, 'Remote Control switched off');
     assert.ok((await readFile(copyPath)).equals(copied), 'the repaired copy equals a fresh one');
     assert.equal((await readJson<SessionRecord>(copy.record!.path))['remoteControlUserToggled'], true);
     await rebuild();
-    assert.equal((await transfer(listed(ACCOUNT_A, 'R-rc'), account(ACCOUNT_B), 'copy')).action, 'up-to-date');
-  });
-
-  it('a move switches Remote Control off, and restore brings the transcript back byte for byte', async () => {
-    const world = state.world;
-    const t = await writeTranscript(world, { prompts: 1, title: 'T-rc-move', bridgeOwner: ACCOUNT_A });
-    const { path: recordPath } = await writeRecord(world, world.a, { cliSessionId: t.cliId, title: 'R-rc-move', remoteControlUserEnabled: true });
-    await rebuild();
-    const before = await readFile(t.path);
-    const outcome = await transfer(listed(ACCOUNT_A, 'R-rc-move'), account(ACCOUNT_B), 'move');
-    assert.equal(outcome.action, 'moved');
-    assert.ok((await readFile(t.path)).equals(Buffer.concat([before, Buffer.from(`${bridgeTombstone(t.cliId)}\n`)])));
-    const moved = await readJson<SessionRecord>(path.join(world.b.dir, path.basename(recordPath)));
-    assert.equal(moved['remoteControlUserEnabled'], false);
-    await restoreEntry(state.context, outcome.journalId!);
-    assert.ok((await readFile(t.path)).equals(before));
-    assert.equal((await readJson<SessionRecord>(recordPath))['remoteControlUserEnabled'], true);
-    await rebuild();
+    assert.equal((await transfer(listed(ACCOUNT_A, 'R-rc'), account(ACCOUNT_B))).action, 'up-to-date');
   });
 
   it('transferred transcripts do not lend their e-mail to the target account', async () => {
-    // By now account B holds copies and moved records whose transcripts all carry
-    // EMAIL_A session_context lines from before the transfer; none may count.
+    // By now account B holds copies whose transcripts all carry EMAIL_A
+    // session_context lines from before the transfer; none may count.
     assert.equal(account(ACCOUNT_B).email, null);
     const copy = listed(ACCOUNT_B, 'R1');
     assert.ok(copy.transcript);
@@ -446,7 +488,7 @@ describe('operations', () => {
     const t = await writeTranscript(world, { prompts: 1, title: 'T-dirs' });
     await writeRecord(world, world.a, { cliSessionId: t.cliId, title: 'R-dirs' });
     await rebuild();
-    const outcome = await transfer(listed(ACCOUNT_A, 'R-dirs'), account(ACCOUNT_B), 'copy');
+    const outcome = await transfer(listed(ACCOUNT_A, 'R-dirs'), account(ACCOUNT_B));
     assert.equal(outcome.action, 'created');
     const newCli = outcome.newCliSessionId!;
     for (const file of sessionKeyedFixtureFiles(t.cliId)) {
@@ -535,7 +577,7 @@ describe('operations: SSH sessions', () => {
 
   it('plans an SSH copy by looking at the host, read only', async () => {
     const hostBefore = await readTree(hostHome(state.world));
-    const outcome = await transfer(listed(ACCOUNT_A, 'S1'), account(ACCOUNT_B), 'copy', 'skip', true);
+    const outcome = await transfer(listed(ACCOUNT_A, 'S1'), account(ACCOUNT_B), 'sync', true);
     assert.equal(outcome.action, 'created');
     assert.equal(outcome.host, `transcript also on ${SSH_HOST}`);
     assert.deepEqual(await readTree(hostHome(state.world)), hostBefore);
@@ -546,7 +588,7 @@ describe('operations: SSH sessions', () => {
     const source = listed(ACCOUNT_A, 'S1');
     assert.ok(source.transcript && isSshMirror(source.transcript));
     const sourceBefore = await readTree(ssh.mirrorDir);
-    const outcome = await transfer(source, account(ACCOUNT_B), 'copy');
+    const outcome = await transfer(source, account(ACCOUNT_B));
     assert.equal(outcome.action, 'created');
     const newCli = outcome.newCliSessionId!;
     const mirror = sshMirrorDir(state.world.paths.projectsRoot, newCli);
@@ -605,14 +647,31 @@ describe('operations: SSH sessions', () => {
   });
 
   it('finds the copy again on the next run, also after the app dropped the stamp', async () => {
-    assert.equal((await transfer(listed(ACCOUNT_A, 'S1'), account(ACCOUNT_B), 'copy')).action, 'up-to-date');
+    assert.equal((await transfer(listed(ACCOUNT_A, 'S1'), account(ACCOUNT_B))).action, 'up-to-date');
     // The app rewrites records from a list of fields it knows, so the stamp goes; lineage.json still links the pair.
     const copy = listed(ACCOUNT_B, 'S1');
     const { ccas, ...saved } = await readJson<SessionRecord>(copy.record!.path);
     assert.ok(ccas);
     await writeFile(copy.record!.path, JSON.stringify(saved, null, 2));
     await rebuild();
-    assert.equal((await transfer(listed(ACCOUNT_A, 'S1'), account(ACCOUNT_B), 'copy')).action, 'up-to-date');
+    assert.equal((await transfer(listed(ACCOUNT_A, 'S1'), account(ACCOUNT_B))).action, 'up-to-date');
+  });
+
+  it('skipping an identical SSH pair never asks the host, while keeping it does', async () => {
+    // Why the TUI's "Skip" answer exists for identical pairs (2026-10-07): the
+    // sync policy plans the repair of an old copy, which probes the host, and
+    // a sync of hundreds of SSH conversations paid that probe for every one of
+    // them. With the host unreachable, sync fails at the probe; skip never gets
+    // there and writes nothing.
+    const offline = { ...state.context, host: unreachableHostRunner };
+    const journalBefore = (await state.context.journal.list()).length;
+    const skipped = await transfer(listed(ACCOUNT_A, 'S1'), account(ACCOUNT_B), 'skip', false, offline);
+    assert.equal(skipped.action, 'skipped');
+    assert.equal(skipped.reason, 'the target copy is identical; left as answered');
+    assert.equal((await state.context.journal.list()).length, journalBefore);
+    const kept = await transfer(listed(ACCOUNT_A, 'S1'), account(ACCOUNT_B), 'sync', false, offline);
+    assert.equal(kept.action, 'failed');
+    assert.match(kept.reason ?? '', /could not reach build@mini\.local over ssh/);
   });
 
   it('updates the copy after the source grew, and restore puts the old mirror and the old host copy back exactly', async () => {
@@ -625,7 +684,7 @@ describe('operations: SSH sessions', () => {
     // The CLI wrote the new rounds on the host, and the app mirrored them.
     await copyFile(ssh.path, onHost(ssh.cliId));
     await rebuild();
-    const outcome = await transfer(listed(ACCOUNT_A, 'S1'), account(ACCOUNT_B), 'copy');
+    const outcome = await transfer(listed(ACCOUNT_A, 'S1'), account(ACCOUNT_B));
     assert.equal(outcome.action, 'updated');
     const after = listed(ACCOUNT_B, 'S1');
     assert.equal(after.record?.record.sessionId, copy.record?.record.sessionId);
@@ -656,23 +715,6 @@ describe('operations: SSH sessions', () => {
     await rebuild();
   });
 
-  it('a move onto the copy updates it, moves the source mirror away and warns about the process on the host', async () => {
-    const source = listed(ACCOUNT_A, 'S1');
-    const outcome = await transfer(source, account(ACCOUNT_B), 'move');
-    assert.equal(outcome.action, 'moved');
-    assert.ok(outcome.warnings.some((warning) => warning.includes('rp_4242') && warning.includes(SSH_HOST)));
-    assert.equal(await pathExists(ssh.mirrorDir), false);
-    assert.equal(await pathExists(source.record!.path), false);
-    assert.ok(await pathExists(onHost(ssh.cliId)), 'the original stays on the host');
-    const entry = await state.context.journal.get(outcome.journalId!);
-    assert.ok(entry?.moved.some((move) => move.from === ssh.mirrorDir));
-    // Undone, so the source is back for the tests below.
-    await restoreEntry(state.context, outcome.journalId!);
-    assert.ok(await pathExists(ssh.mirrorDir));
-    assert.ok(await pathExists(source.record!.path));
-    await rebuild();
-  });
-
   it('rolls an SSH copy back, on the host too, when Claude Code appears half-way', async () => {
     await addSshConversation('S2', { prompts: 1, agents: 1 });
     await rebuild();
@@ -681,7 +723,7 @@ describe('operations: SSH sessions', () => {
     const hostBefore = (await readdir(hostProjectDir(state.world))).sort();
     let calls = 0;
     const flaky = { ...state.context, guard: async () => (++calls === 1 ? { allowed: true, reason: null } : { allowed: false, reason: 'Claude started' }) };
-    const outcome = await transfer(listed(ACCOUNT_A, 'S2'), account(ACCOUNT_B), 'copy', 'skip', false, flaky);
+    const outcome = await transfer(listed(ACCOUNT_A, 'S2'), account(ACCOUNT_B), 'sync', false, flaky);
     assert.equal(outcome.action, 'refused');
     assert.deepEqual((await readdir(state.world.paths.projectsRoot)).sort(), projectsBefore);
     assert.deepEqual(await recordsIn(state.world.b.dir), recordsBefore);
@@ -707,12 +749,12 @@ describe('operations: SSH sessions', () => {
     await rebuild();
     assert.equal(listed(ACCOUNT_A, 'P').key, listed(ACCOUNT_A, 'F').key, 'parent and fork start alike');
 
-    assert.equal((await transfer(listed(ACCOUNT_A, 'P'), account(ACCOUNT_B), 'copy')).action, 'created');
-    assert.equal((await transfer(listed(ACCOUNT_A, 'F'), account(ACCOUNT_B), 'copy')).action, 'created');
+    assert.equal((await transfer(listed(ACCOUNT_A, 'P'), account(ACCOUNT_B))).action, 'created');
+    assert.equal((await transfer(listed(ACCOUNT_A, 'F'), account(ACCOUNT_B))).action, 'created');
     assert.deepEqual(listed(ACCOUNT_B, 'P').summary?.uuidChain, listed(ACCOUNT_A, 'P').summary?.uuidChain);
     assert.deepEqual(listed(ACCOUNT_B, 'F').summary?.uuidChain, listed(ACCOUNT_A, 'F').summary?.uuidChain);
-    assert.equal((await transfer(listed(ACCOUNT_A, 'P'), account(ACCOUNT_B), 'copy')).action, 'up-to-date');
-    assert.equal((await transfer(listed(ACCOUNT_A, 'F'), account(ACCOUNT_B), 'copy')).action, 'up-to-date');
+    assert.equal((await transfer(listed(ACCOUNT_A, 'P'), account(ACCOUNT_B))).action, 'up-to-date');
+    assert.equal((await transfer(listed(ACCOUNT_A, 'F'), account(ACCOUNT_B))).action, 'up-to-date');
   });
 
   it('skips a copy that was continued as a new session and leaves it alone', async () => {
@@ -725,8 +767,9 @@ describe('operations: SSH sessions', () => {
     await writeFile(copy.record!.path, JSON.stringify({ ...saved, cliSessionId: fresh.cliId }, null, 2));
     await rebuild();
     const freshBefore = await readTree(fresh.mirrorDir);
-    for (const policy of ['skip', 'overwrite'] as const) {
-      const outcome = await transfer(listed(ACCOUNT_A, 'P'), account(ACCOUNT_B), 'copy', policy);
+    // Under every policy, the TUI's "overwrite" included: a copy that holds another conversation is never touched.
+    for (const policy of ['sync', 'overwrite-conflicts', 'skip', 'overwrite'] as const) {
+      const outcome = await transfer(listed(ACCOUNT_A, 'P'), account(ACCOUNT_B), policy);
       assert.equal(outcome.action, 'skipped');
       assert.match(outcome.reason ?? '', /different conversation/);
     }
@@ -737,7 +780,7 @@ describe('operations: SSH sessions', () => {
     const orphanCli = randomUUID();
     await writeRecord(state.world, state.world.a, { cliSessionId: orphanCli, title: 'S-orphan', ...sshRecordFields(orphanCli) });
     await rebuild();
-    const outcome = await transfer(listed(ACCOUNT_A, 'S-orphan'), account(ACCOUNT_B), 'copy');
+    const outcome = await transfer(listed(ACCOUNT_A, 'S-orphan'), account(ACCOUNT_B));
     assert.equal(outcome.action, 'created');
     assert.ok(outcome.warnings.some((warning) => warning.includes('the copy is the record alone')), outcome.warnings.join('; '));
     const recordPath = path.join(state.world.b.dir, `${outcome.newSessionId}.json`);
@@ -746,22 +789,22 @@ describe('operations: SSH sessions', () => {
     assert.notEqual(record.cliSessionId, orphanCli);
     for (const field of SOURCE_BOUND_FIELDS) assert.ok(!(field in record), field);
     assert.deepEqual((await state.context.journal.get(outcome.journalId!))?.created, [recordPath]);
-    assert.equal((await transfer(listed(ACCOUNT_A, 'S-orphan'), account(ACCOUNT_B), 'copy')).action, 'up-to-date');
+    assert.equal((await transfer(listed(ACCOUNT_A, 'S-orphan'), account(ACCOUNT_B))).action, 'up-to-date');
   });
 
   it('repairs a copy made before copies got their host transcript and Remote Control off', async () => {
     const inherited = { remoteControlUserEnabled: true, remoteControlAutoEligible: true };
     await addSshConversation('S4', { prompts: 1, agents: 1 }, { record: inherited });
     await rebuild();
-    assert.equal((await transfer(listed(ACCOUNT_A, 'S4'), account(ACCOUNT_B), 'copy')).action, 'created');
+    assert.equal((await transfer(listed(ACCOUNT_A, 'S4'), account(ACCOUNT_B))).action, 'created');
     const copy = listed(ACCOUNT_B, 'S4');
     await makeOldStyle(copy, inherited);
     await rebuild();
 
-    const dry = await transfer(listed(ACCOUNT_A, 'S4'), account(ACCOUNT_B), 'copy', 'skip', true);
+    const dry = await transfer(listed(ACCOUNT_A, 'S4'), account(ACCOUNT_B), 'sync', true);
     assert.equal(dry.action, 'repaired');
     assert.equal(await pathExists(onHost(copy.cliSessionId!)), false, 'a dry run changes nothing');
-    const outcome = await transfer(listed(ACCOUNT_A, 'S4'), account(ACCOUNT_B), 'copy');
+    const outcome = await transfer(listed(ACCOUNT_A, 'S4'), account(ACCOUNT_B));
     assert.equal(outcome.action, 'repaired');
     assert.equal(outcome.reason, `Remote Control switched off; transcript created on ${SSH_HOST}`);
     const hostCopied = await readFile(onHost(copy.cliSessionId!));
@@ -776,7 +819,7 @@ describe('operations: SSH sessions', () => {
     assert.equal(entry?.action, 'repaired');
     assert.deepEqual(entry?.backedUp, [copy.record!.path]);
     await rebuild();
-    assert.equal((await transfer(listed(ACCOUNT_A, 'S4'), account(ACCOUNT_B), 'copy')).action, 'up-to-date');
+    assert.equal((await transfer(listed(ACCOUNT_A, 'S4'), account(ACCOUNT_B))).action, 'up-to-date');
 
     // Undoing the repair takes the host copy away again and brings the old record back.
     await restoreEntry(state.context, outcome.journalId!);
@@ -790,7 +833,7 @@ describe('operations: SSH sessions', () => {
     // CLI session id from the record. No new session was started in it yet.
     await addSshConversation('S5', { prompts: 1, agents: 1 });
     await rebuild();
-    assert.equal((await transfer(listed(ACCOUNT_A, 'S5'), account(ACCOUNT_B), 'copy')).action, 'created');
+    assert.equal((await transfer(listed(ACCOUNT_A, 'S5'), account(ACCOUNT_B))).action, 'created');
     const copy = listed(ACCOUNT_B, 'S5');
     const lostCli = copy.cliSessionId!;
     await makeOldStyle(copy, {});
@@ -800,7 +843,7 @@ describe('operations: SSH sessions', () => {
     await rebuild();
     assert.equal(assessSync(listed(ACCOUNT_A, 'S5'), conversationsOf(state.inventory, account(ACCOUNT_B))).state, 'update-available');
 
-    const outcome = await transfer(listed(ACCOUNT_A, 'S5'), account(ACCOUNT_B), 'copy');
+    const outcome = await transfer(listed(ACCOUNT_A, 'S5'), account(ACCOUNT_B));
     assert.equal(outcome.action, 'updated');
     const record = await readJson<SessionRecord>(copy.record!.path);
     assert.equal(record.cliSessionId, lostCli);
@@ -808,13 +851,13 @@ describe('operations: SSH sessions', () => {
     assert.equal(listed(ACCOUNT_B, 'S5').transcript?.path, path.join(sshMirrorDir(state.world.paths.projectsRoot, lostCli), `${lostCli}.jsonl`));
     const entry = await state.context.journal.get(outcome.journalId!);
     assert.deepEqual(entry?.moved.map((move) => move.from), [sshMirrorDir(state.world.paths.projectsRoot, lostCli)], 'the old mirror went into the backup');
-    assert.equal((await transfer(listed(ACCOUNT_A, 'S5'), account(ACCOUNT_B), 'copy')).action, 'up-to-date');
+    assert.equal((await transfer(listed(ACCOUNT_A, 'S5'), account(ACCOUNT_B))).action, 'up-to-date');
   });
 
   it('leaves Remote Control alone when it was switched on for the copy on the target account', async () => {
     await addSshConversation('S6', { prompts: 1, agents: 0 });
     await rebuild();
-    assert.equal((await transfer(listed(ACCOUNT_A, 'S6'), account(ACCOUNT_B), 'copy')).action, 'created');
+    assert.equal((await transfer(listed(ACCOUNT_A, 'S6'), account(ACCOUNT_B))).action, 'created');
     const copy = listed(ACCOUNT_B, 'S6');
     // The person switched Remote Control on for the copy: a new claude.ai session of account B.
     const saved = await readJson<SessionRecord>(copy.record!.path);
@@ -822,7 +865,7 @@ describe('operations: SSH sessions', () => {
     await appendFile(onHost(copy.cliSessionId!), `${JSON.stringify({ type: 'bridge-session', sessionId: copy.cliSessionId, bridgeSessionId: 'cse_of_account_b', lastSequenceNum: 4 })}\n`);
     await rebuild();
     const hostBefore = await readFile(onHost(copy.cliSessionId!));
-    const outcome = await transfer(listed(ACCOUNT_A, 'S6'), account(ACCOUNT_B), 'copy');
+    const outcome = await transfer(listed(ACCOUNT_A, 'S6'), account(ACCOUNT_B));
     assert.equal(outcome.action, 'up-to-date');
     assert.ok((await readFile(onHost(copy.cliSessionId!))).equals(hostBefore));
     assert.equal((await readJson<SessionRecord>(copy.record!.path))['remoteControlUserEnabled'], true);
@@ -835,7 +878,7 @@ describe('operations: SSH sessions', () => {
     const recordsBefore = await recordsIn(state.world.b.dir);
     const journalBefore = (await state.context.journal.list()).length;
     const offline = { ...state.context, host: unreachableHostRunner };
-    const outcome = await transfer(listed(ACCOUNT_A, 'S7'), account(ACCOUNT_B), 'copy', 'skip', false, offline);
+    const outcome = await transfer(listed(ACCOUNT_A, 'S7'), account(ACCOUNT_B), 'sync', false, offline);
     assert.equal(outcome.action, 'failed');
     assert.match(outcome.reason ?? '', /could not reach build@mini\.local over ssh .*Connection refused.*ssh build@mini\.local true/);
     assert.deepEqual((await readdir(state.world.paths.projectsRoot)).sort(), projectsBefore);
@@ -846,37 +889,10 @@ describe('operations: SSH sessions', () => {
   it('does not copy an SSH conversation whose original is not on the host', async () => {
     await addSshConversation('S8', { prompts: 1, agents: 0 }, { onHost: false });
     await rebuild();
-    const outcome = await transfer(listed(ACCOUNT_A, 'S8'), account(ACCOUNT_B), 'copy');
+    const outcome = await transfer(listed(ACCOUNT_A, 'S8'), account(ACCOUNT_B));
     assert.equal(outcome.action, 'failed');
     assert.match(outcome.reason ?? '', /has no transcript .*\.jsonl, so a copy could not be resumed there/);
     assert.ok(!state.inventory.byAccount.get(accountKey(ACCOUNT_B.accountId, ACCOUNT_B.orgId))?.some((conversation) => conversation.title === 'S8'));
-  });
-
-  it('a move switches Remote Control off in the record and in the transcript on the host', async () => {
-    const moving = await addSshConversation('S9', { prompts: 1, agents: 0 }, { record: { remoteControlUserEnabled: true } });
-    await rebuild();
-    const source = listed(ACCOUNT_A, 'S9');
-    const hostBefore = await readFile(onHost(moving.cliId));
-    const dry = await transfer(source, account(ACCOUNT_B), 'move', 'skip', true);
-    assert.equal(dry.host, `Remote Control off on ${SSH_HOST}`);
-    assert.ok((await readFile(onHost(moving.cliId))).equals(hostBefore), 'a dry run changes nothing on the host');
-
-    const outcome = await transfer(source, account(ACCOUNT_B), 'move');
-    assert.equal(outcome.action, 'moved');
-    const moved = listed(ACCOUNT_B, 'S9');
-    assert.equal(moved.record?.record.sessionId, source.record?.record.sessionId);
-    assert.equal(moved.record?.record['remoteControlUserEnabled'], false);
-    assert.equal(moved.record?.record['remoteControlUserToggled'], true);
-    assert.ok(!('bridgeSessionIds' in moved.record!.record));
-    const hostAfter = await readFile(onHost(moving.cliId));
-    assert.ok(hostAfter.equals(Buffer.concat([hostBefore, Buffer.from(`${bridgeTombstone(moving.cliId)}\n`)])));
-    assert.ok(hostAfter.subarray(0, (await readFile(moving.path)).length).equals(await readFile(moving.path)), 'the local mirror is untouched, a prefix of the host file');
-    assert.deepEqual((await state.context.journal.get(outcome.journalId!))?.remote?.tombstoned, [onHost(moving.cliId)]);
-
-    const restored = await restoreEntry(state.context, outcome.journalId!);
-    assert.ok(restored.warnings.some((warning) => warning.includes('keeps its Remote Control tombstones')));
-    assert.equal((await readJson<SessionRecord>(source.record!.path))['remoteControlUserEnabled'], true);
-    await rebuild();
   });
 
   it('leaves a journal entry an interrupted copy can be undone from', async () => {
@@ -889,7 +905,7 @@ describe('operations: SSH sessions', () => {
     const cut = { ...state.context, journal: new CuttingJournal(state.world.paths.dataDir, 1) };
     const source = listed(ACCOUNT_A, 'S3');
     await assert.rejects(
-      () => executeTransfer(cut, { source, target: account(ACCOUNT_B), mode: 'copy', assessment: assessSync(source, conversationsOf(state.inventory, account(ACCOUNT_B))), onConflict: 'skip' }),
+      () => executeTransfer(cut, { source, target: account(ACCOUNT_B), assessment: assessSync(source, conversationsOf(state.inventory, account(ACCOUNT_B))), onExisting: 'sync' }),
       /simulated power cut/,
     );
     const [entry] = await state.context.journal.interrupted();
@@ -913,7 +929,7 @@ describe('operations: SSH sessions', () => {
     // conversation; the copy needs them there under its own id.
     const written = await addSshConversation('S-dirs', { prompts: 1 });
     await rebuild();
-    const outcome = await transfer(listed(ACCOUNT_A, 'S-dirs'), account(ACCOUNT_B), 'copy');
+    const outcome = await transfer(listed(ACCOUNT_A, 'S-dirs'), account(ACCOUNT_B));
     assert.equal(outcome.action, 'created');
     const newCli = outcome.newCliSessionId!;
     const hostClaude = path.join(hostHome(state.world), '.claude');
@@ -934,66 +950,5 @@ describe('operations: SSH sessions', () => {
       assert.ok(await pathExists(path.join(hostClaude, dir, written.cliId)), `${dir} of the original stays`);
     }
     await rebuild();
-  });
-});
-
-describe('operations: lineage links for moves', () => {
-  const { state, rebuild, account, listed, transfer } = harness({ withLineage: true });
-
-  before(async () => {
-    state.world = await makeWorld();
-    const world = state.world;
-    state.context = { paths: world.paths, journal: new Journal(world.paths.dataDir), lineage: await LineageStore.load(world.paths.dataDir), dryRun: false };
-    const t = await writeTranscript(world, { prompts: 2, email: EMAIL_A, title: 'T-move' });
-    await writeRecord(world, world.a, { cliSessionId: t.cliId, title: 'R-move' });
-    await rebuild();
-  });
-  after(async () => {
-    await destroyWorld(state.world);
-  });
-
-  it('a move writes a lineage link naming both accounts', async () => {
-    const source = listed(ACCOUNT_A, 'R-move');
-    assert.ok(source.record && source.summary);
-    const outcome = await transfer(source, account(ACCOUNT_B), 'move');
-    assert.equal(outcome.action, 'moved');
-    const link = state.context.lineage.all().at(-1);
-    assert.ok(link, 'the move left a link');
-    assert.equal(link.mode, 'move');
-    assert.equal(link.action, 'moved');
-    assert.equal(link.journalId, outcome.journalId);
-    assert.equal(link.sourceLineCount, source.summary.lineCount);
-    const sessionId = source.record.record.sessionId;
-    assert.deepEqual(link.source, { accountId: ACCOUNT_A.accountId, orgId: ACCOUNT_A.orgId, sessionId, cliSessionId: source.cliSessionId });
-    assert.deepEqual(link.target, { accountId: ACCOUNT_B.accountId, orgId: ACCOUNT_B.orgId, sessionId, cliSessionId: source.cliSessionId });
-  });
-
-  it('a moved record does not lend its e-mail to the target after the app dropped the stamp', async () => {
-    // The app writes records from the list of fields it knows, so the ccas
-    // stamp is gone the first time it saves the moved record. The link the
-    // move wrote is then the only thing that keeps the session_context lines
-    // of the source account from voting for the target account.
-    const moved = listed(ACCOUNT_B, 'R-move');
-    assert.ok(moved.record);
-    assert.ok(moved.record.record.ccas, 'the stamp is there right after the move');
-    assert.equal(account(ACCOUNT_B).email, null);
-    const saved = structuredClone(moved.record.record);
-    delete saved.ccas;
-    await writeFile(moved.record.path, JSON.stringify(saved, null, 2));
-    await rebuild();
-    assert.equal(account(ACCOUNT_B).email, null, 'the source account e-mail must not become the target account e-mail');
-    assert.equal(account(ACCOUNT_A).email, EMAIL_A);
-  });
-
-  it('restore of a move leaves the link harmless', async () => {
-    const entry = (await state.context.journal.list()).find((candidate) => candidate.mode === 'move');
-    assert.ok(entry);
-    await restoreEntry(state.context, entry.id);
-    await rebuild();
-    const back = listed(ACCOUNT_A, 'R-move');
-    const again = await transfer(back, account(ACCOUNT_B), 'move');
-    assert.equal(again.action, 'moved');
-    assert.equal(state.context.lineage.all().filter((link) => link.mode === 'move').length, 2);
-    assert.equal(account(ACCOUNT_B).email, null);
   });
 });

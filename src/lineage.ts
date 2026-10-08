@@ -14,15 +14,18 @@
 // was written but before the record) names a record that does not exist, and
 // pairing ignores it.
 //
-// Moves write links too (since 2026-10-05): the record keeps its id, so both
-// ends name the same record id under different accounts. Pairing does not
-// need such a link (the record id already pairs a moved record with whatever
-// still refers to it), but the e-mail votes do: a moved transcript carries
-// the source account's session_context lines, and the link's sourceLineCount
-// is the lasting copy point past which sightings count for the new account
-// (inventory.ts, voteEmail). Before that, a move relied on the ccas stamp
-// alone, and once the app had saved the record and dropped the stamp, the
-// source account's e-mail voted for the target account.
+// Links of mode "move" come from versions before 2026-10-07, which could
+// move a conversation between accounts (the tool copies only now). A move
+// kept the record id, so both ends of such a link name the same record id
+// under different accounts. Pairing does not need the link (the record id
+// already pairs a moved record with whatever still refers to it), but the
+// e-mail votes do: a moved transcript carries the source account's
+// session_context lines, and the link's sourceLineCount is the lasting copy
+// point past which sightings count for the new account (inventory.ts,
+// voteEmail). Moves made before 2026-10-05 wrote no link at all and relied on
+// the ccas stamp, and once the app had saved the record and dropped the
+// stamp, the source account's e-mail voted for the target account; the
+// links written since keep that from happening, so they are still read.
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { writeFileAtomic } from './fsx.ts';

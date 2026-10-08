@@ -1,7 +1,7 @@
 {
   "name": "claude-code-account-switch-import-convos",
   "version": "0.1.0",
-  "description": "Move or copy Claude Code Desktop conversations between logged-in accounts on macOS",
+  "description": "Copy Claude Code Desktop conversations between logged-in accounts on macOS",
   "type": "module",
   "private": true,
   "bin": {

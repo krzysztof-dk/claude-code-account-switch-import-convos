@@ -117,7 +117,7 @@ export async function runTui(session: TuiSession, options: TuiOptions = {}): Pro
     const choice = await p.select({
       message: 'What next?',
       options: [
-        { value: 'transfer', label: 'Transfer conversations', hint: 'copy (sync) or move between accounts, import unlisted transcripts' },
+        { value: 'transfer', label: 'Transfer conversations', hint: 'copy (sync) between accounts, import unlisted transcripts' },
         { value: 'accounts', label: 'Accounts', hint: 'names and e-mails' },
         { value: 'restore', label: 'Restore from journal', hint: 'undo a previous operation' },
         { value: 'rescan', label: 'Rescan', hint: 'read the directories again' },
